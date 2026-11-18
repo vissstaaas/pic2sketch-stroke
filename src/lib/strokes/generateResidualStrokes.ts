@@ -1,192 +1,302 @@
-import { gaussianBlur, type SketchTarget } from '../image/buildSketchTarget';
 import type { StrokeGenerationOptions } from '../../types/image-processing';
-import type { Stroke, StrokeLayer, StrokePoint } from '../../types/stroke';
+import type { PencilGrade, Stroke, StrokeLayer, StrokePoint } from '../../types/stroke';
+import { clamp, clamp01 } from '../../utils/math';
 import type { SeededRandom } from '../../utils/random';
+import { createRasterScratch, rasterizeStrokeCoverage } from '../canvas/brushMath';
+import { gaussianBlur, type SketchTarget } from '../image/buildSketchTarget';
 
-interface TonalPass {
+interface TonalPassConfig {
   spacing: number;
   length: number;
   width: number;
   opacity: number;
   threshold: number;
-  quota: number;
+  quotaRatio: number;
   layer: StrokeLayer;
-  baseAngle: number;
+  grade: PencilGrade;
+  crossOffsetRad: number;
+  fallbackAngleRad: number;
   repeats: number;
 }
 
-interface Candidate {
+interface TonalCandidate {
   x: number;
   y: number;
   score: number;
-  angleJitter: number;
+  jitterRad: number;
 }
 
 /**
- * Reconstructs the hidden target with real, replayable graphite strokes.
- * Each pass compares the simulated paper against the target and spends its
- * stroke budget only where darkness is still missing.
+ * Coarse-to-fine greedy residual tonal planner with ETF streamline tracing,
+ * multi-angle cross-hatching, and zero-allocation sparse ribbon coverage accounting.
  */
 export function generateResidualStrokes(
   target: SketchTarget,
   options: StrokeGenerationOptions,
-  rng: SeededRandom
+  rng: SeededRandom,
+  preLaidStrokes?: readonly Stroke[]
 ): Stroke[] {
-  const { width, height, darkness, detail, tangent, coherence } = target;
+  const { width, height, darkness, detail, foreground, tangent, tangentX, tangentY, coherence } =
+    target;
   const achieved = new Float32Array(width * height);
-  const scale = clamp(Math.max(width, height) / 768, 0.45, 1.5);
-  const budget = Math.max(100, Math.floor(options.targetStrokeCount * 0.84));
+  const rasterScratch = createRasterScratch(width, height);
+
+  if (preLaidStrokes && preLaidStrokes.length > 0) {
+    for (const s of preLaidStrokes) {
+      rasterizeStrokeCoverage(
+        achieved,
+        width,
+        height,
+        {
+          ...s,
+          brush: { ...s.brush, opacity: s.brush.opacity * 0.7 },
+        },
+        rasterScratch
+      );
+    }
+  }
+
+  const scale = clamp(Math.max(width, height) / 768, 0.45, 1.6);
+  const stylePreset = options.stylePreset ?? 'classic';
+  const tonalShare = stylePreset === 'lineart' ? 0.42 : stylePreset === 'portrait' ? 0.76 : 0.78;
+  const budget = Math.max(60, Math.floor(options.targetStrokeCount * tonalShare));
   const density = clamp(options.shadingDensity, 0.2, 1);
-  const coarseTone = gaussianBlur(target.tone, width, height, Math.max(1, 2.8 * scale));
-  const midTone = gaussianBlur(target.tone, width, height, Math.max(0.7, 1.35 * scale));
-  const passes: TonalPass[] = [
+  const bgSuppression = clamp01(options.backgroundSuppression);
+  const paperGrain = clamp01(options.paperGrain ?? 0.35);
+
+  const minAllowedLen = Math.max(2.2, options.minStrokeLength * 0.7 * scale);
+  const maxAllowedLen = Math.max(minAllowedLen + 4, options.maxStrokeLength * scale);
+
+  const broadTone = gaussianBlur(target.tone, width, height, Math.max(1.0, 2.5 * scale));
+  const midFormTone = gaussianBlur(target.tone, width, height, Math.max(0.7, 1.2 * scale));
+
+  // Pass 0 & 1 include low thresholds (0.018 / 0.025) so delicate skin half-tones,
+  // neck shadows, and white-garment pleats receive translucent HB/2B form modeling.
+  const passes: TonalPassConfig[] = [
     {
-      spacing: 17 * scale,
-      length: 34 * scale,
-      width: 5.2 * scale,
-      opacity: 0.14,
-      threshold: 0.075,
-      quota: Math.round(budget * 0.14),
+      spacing: 14.0 * scale,
+      length: clamp(35 * scale, minAllowedLen, maxAllowedLen),
+      width: 4.8 * scale,
+      opacity: 0.1,
+      threshold: 0.022,
+      quotaRatio: 0.16,
       layer: 'lightTone',
-      baseAngle: -0.52,
+      grade: 'HB',
+      crossOffsetRad: 0,
+      fallbackAngleRad: -0.66,
       repeats: 3,
     },
     {
-      spacing: 10.5 * scale,
-      length: 23 * scale,
-      width: 3.25 * scale,
-      opacity: 0.17,
-      threshold: 0.052,
-      quota: Math.round(budget * 0.22),
+      spacing: 9.0 * scale,
+      length: clamp(24 * scale, minAllowedLen, maxAllowedLen),
+      width: 3.0 * scale,
+      opacity: 0.16,
+      threshold: 0.032,
+      quotaRatio: 0.23,
       layer: 'midTone',
-      baseAngle: 0.48,
+      grade: '2B',
+      crossOffsetRad: 0.58,
+      fallbackAngleRad: -0.08,
       repeats: 3,
     },
     {
-      spacing: 6.4 * scale,
-      length: 14 * scale,
+      spacing: 5.6 * scale,
+      length: clamp(15 * scale, minAllowedLen, maxAllowedLen),
       width: 1.85 * scale,
-      opacity: 0.2,
-      threshold: 0.036,
-      quota: Math.round(budget * 0.28),
+      opacity: 0.24,
+      threshold: 0.028,
+      quotaRatio: 0.26,
       layer: 'darkTone',
-      baseAngle: -0.36,
+      grade: '4B',
+      crossOffsetRad: -0.46,
+      fallbackAngleRad: -1.12,
       repeats: 3,
     },
     {
-      spacing: 4.1 * scale,
-      length: 8.5 * scale,
-      width: 1.05 * scale,
-      opacity: 0.24,
-      threshold: 0.026,
-      quota: Math.round(budget * 0.22),
+      spacing: 3.8 * scale,
+      length: clamp(9.2 * scale, minAllowedLen, maxAllowedLen),
+      width: 1.12 * scale,
+      opacity: 0.3,
+      threshold: 0.02,
+      quotaRatio: 0.2,
       layer: 'finalAccent',
-      baseAngle: 0.7,
-      repeats: 2,
+      grade: '4B',
+      crossOffsetRad: 0.24,
+      fallbackAngleRad: 0.52,
+      repeats: 3,
     },
     {
-      spacing: 3.15 * scale,
-      length: 6.2 * scale,
-      width: 0.78 * scale,
-      opacity: 0.29,
-      threshold: 0.014,
-      quota: Math.round(budget * 0.14),
+      spacing: 2.8 * scale,
+      length: clamp(6.4 * scale, minAllowedLen, maxAllowedLen),
+      width: 0.82 * scale,
+      opacity: 0.36,
+      threshold: 0.013,
+      quotaRatio: 0.14,
       layer: 'finalAccent',
-      baseAngle: -0.66,
+      grade: '6B',
+      crossOffsetRad: 0,
+      fallbackAngleRad: -0.62,
       repeats: 4,
     },
   ];
 
   const strokes: Stroke[] = [];
-  let id = 0;
+  let serial = 0;
 
   for (let passIndex = 0; passIndex < passes.length; passIndex++) {
     const pass = passes[passIndex];
-    const passTarget = passIndex === 0 ? coarseTone : passIndex === 1 ? midTone : darkness;
-    const candidates = buildCandidates(target, passTarget, achieved, pass, rng);
-    let used = 0;
+    const passQuota = Math.max(8, Math.round(budget * pass.quotaRatio));
+    const passTarget = passIndex === 0 ? broadTone : passIndex === 1 ? midFormTone : darkness;
+    const effectiveThreshold = pass.threshold / Math.pow(density, 0.85);
 
+    const candidates = samplePassCandidates(
+      width,
+      height,
+      passTarget,
+      detail,
+      foreground,
+      achieved,
+      pass,
+      effectiveThreshold,
+      bgSuppression,
+      rng
+    );
+
+    let placedInPass = 0;
     for (const candidate of candidates) {
-      if (used >= pass.quota || strokes.length >= budget) break;
-      const index = Math.round(candidate.y) * width + Math.round(candidate.x);
-      const residual = localResidual(passTarget, achieved, width, height, candidate.x, candidate.y, pass.width * 0.8);
-      if (residual < pass.threshold / density) continue;
+      if (placedInPass >= passQuota || strokes.length >= budget) break;
 
-      const localTone = passTarget[index] ?? 0;
-      const reliableFlow = (coherence[index] ?? 0) > 0.1;
-      const angle = reliableFlow
-        ? tangent[index] + candidate.angleJitter * 0.16
-        : pass.baseAngle + candidate.angleJitter * 0.24;
-      const length = pass.length * clamp(0.7 + residual * 1.25 + localTone * 0.22, 0.65, 1.55);
-      const opacity = clamp(pass.opacity + residual * 0.22, 0.1, passIndex >= 3 ? 0.52 : 0.36);
-      const points = buildStrokePoints(
-        target,
+      const idx = Math.round(candidate.y) * width + Math.round(candidate.x);
+      const residual = computeLocalResidual(
         passTarget,
         achieved,
+        width,
+        height,
         candidate.x,
         candidate.y,
-        angle,
-        length,
+        pass.width * 0.72
+      );
+      if (residual < effectiveThreshold) continue;
+
+      const localCoherence = coherence[idx] ?? 0;
+      const localTone = passTarget[idx] ?? 0;
+
+      let baseAngle: number;
+      let streamlineFollowWeight: number;
+      if (localCoherence > 0.36) {
+        baseAngle = tangent[idx] + pass.crossOffsetRad * 0.18 + candidate.jitterRad * 0.1;
+        streamlineFollowWeight = 0.88;
+      } else if (localCoherence > 0.12) {
+        baseAngle = tangent[idx] + pass.crossOffsetRad * 0.75 + candidate.jitterRad * 0.14;
+        streamlineFollowWeight = 0.45;
+      } else {
+        baseAngle = pass.fallbackAngleRad + candidate.jitterRad * 0.2;
+        streamlineFollowWeight = 0.15;
+      }
+
+      const desiredLength = clamp(
+        pass.length * clamp(0.72 + residual * 1.15 + localTone * 0.2, 0.65, 1.48),
+        minAllowedLen,
+        maxAllowedLen
+      );
+
+      // Scale opacity gently down for ultra-light skin/garment half-tones so strokes whisper
+      const maxOpacity = passIndex >= 4 ? 0.65 : passIndex >= 3 ? 0.52 : 0.4;
+      const adaptiveBaseOpacity =
+        residual < 0.06 ? Math.min(pass.opacity, residual * 1.65 + 0.035) : pass.opacity;
+      const opacity = clamp(adaptiveBaseOpacity + residual * 0.28, 0.045, maxOpacity);
+
+      const points = traceStreamlineHatch(
+        width,
+        height,
+        passTarget,
+        achieved,
+        tangentX,
+        tangentY,
+        coherence,
+        candidate.x,
+        candidate.y,
+        baseAngle,
+        streamlineFollowWeight,
+        desiredLength,
         pass.width,
-        pass.threshold / density,
+        effectiveThreshold,
         rng
       );
       if (points.length < 2) continue;
 
-      const confidence = clamp(localTone * 0.65 + detail[index] * 0.35, 0.05, 1);
+      const confidence = clamp(localTone * 0.68 + (detail[idx] ?? 0) * 0.32, 0.05, 1);
       const stroke: Stroke = {
-        id: `tone-${passIndex}-${++id}`,
-        kind: passIndex >= 2 ? 'crossHatching' : 'hatching',
+        id: `tone-${passIndex}-${++serial}`,
+        kind: passIndex >= 1 && Math.abs(pass.crossOffsetRad) > 0.2 ? 'crossHatching' : 'hatching',
         layer: pass.layer,
         order: 0,
         points,
         brush: {
           width: pass.width,
           opacity,
-          hardness: Math.min(0.9, 0.48 + passIndex * 0.09),
-          grain: 0.28,
-          jitter: 0.06 * scale,
+          hardness: Math.min(0.92, 0.46 + passIndex * 0.1),
+          grain: clamp(0.18 + paperGrain * 0.32, 0.1, 0.55),
+          jitter: 0.048 * scale,
+          grade: pass.grade,
         },
-        durationMs: clamp(Math.round(length * 1.8), 28, 95),
-        priority: 25 + passIndex * 12 + Math.round(confidence * 10),
+        durationMs: clamp(Math.round(desiredLength * 1.7), 24, 96),
+        priority: 24 + passIndex * 12 + Math.round(confidence * 10),
         sourceConfidence: confidence,
       };
 
       strokes.push(stroke);
-      rasterizeStroke(achieved, width, height, stroke);
-      used++;
+      rasterizeStrokeCoverage(achieved, width, height, stroke, rasterScratch);
+      placedInPass++;
     }
   }
 
   return strokes;
 }
 
-function buildCandidates(
-  target: SketchTarget,
+function samplePassCandidates(
+  width: number,
+  height: number,
   passTarget: Float32Array,
+  detail: Float32Array,
+  foreground: Float32Array,
   achieved: Float32Array,
-  pass: TonalPass,
+  pass: TonalPassConfig,
+  effectiveThreshold: number,
+  bgSuppression: number,
   rng: SeededRandom
-): Candidate[] {
-  const { width, height, detail } = target;
-  const candidates: Candidate[] = [];
-  const spacing = Math.max(2.4, pass.spacing);
+): TonalCandidate[] {
+  const candidates: TonalCandidate[] = [];
+  const spacing = Math.max(2.2, pass.spacing);
 
   for (let repeat = 0; repeat < pass.repeats; repeat++) {
-    const offsetX = ((repeat + 0.35) / pass.repeats) * spacing;
-    const offsetY = (((repeat * 0.618) % 1) + 0.2) * spacing;
-    for (let y = offsetY; y < height; y += spacing) {
-      for (let x = offsetX; x < width; x += spacing) {
-        const jitterX = rng.range(-spacing * 0.28, spacing * 0.28);
-        const jitterY = rng.range(-spacing * 0.28, spacing * 0.28);
-        const px = clamp(x + jitterX, 1, width - 2);
-        const py = clamp(y + jitterY, 1, height - 2);
-        const index = Math.round(py) * width + Math.round(px);
-        const residual = Math.max(0, passTarget[index] - achieved[index]);
-        const score = residual + detail[index] * 0.12 + rng.next() * 0.008;
-        if (score >= pass.threshold * 0.7) {
-          candidates.push({ x: px, y: py, score, angleJitter: rng.range(-1, 1) });
+    const offsetX = ((repeat + 0.31) / pass.repeats) * spacing;
+    const offsetY = (((repeat * 0.618034) % 1) + 0.19) * spacing;
+
+    for (let y = offsetY; y < height - 1; y += spacing) {
+      for (let x = offsetX; x < width - 1; x += spacing) {
+        const px = clamp(x + rng.range(-spacing * 0.3, spacing * 0.3), 1, width - 2);
+        const py = clamp(y + rng.range(-spacing * 0.3, spacing * 0.3), 1, height - 2);
+        const idx = Math.round(py) * width + Math.round(px);
+
+        if (bgSuppression > 0.3 && (foreground[idx] ?? 1) < 0.08 && passTarget[idx] < 0.12) {
+          continue;
         }
+
+        const residual = Math.max(0, passTarget[idx] - achieved[idx]);
+        if (residual < effectiveThreshold * 0.65) continue;
+
+        const score =
+          residual * (0.85 + 0.15 * (foreground[idx] ?? 1)) +
+          detail[idx] * 0.1 +
+          rng.next() * 0.006;
+
+        candidates.push({
+          x: px,
+          y: py,
+          score,
+          jitterRad: rng.range(-1, 1),
+        });
       }
     }
   }
@@ -195,116 +305,116 @@ function buildCandidates(
   return candidates;
 }
 
-function buildStrokePoints(
-  target: SketchTarget,
+function traceStreamlineHatch(
+  width: number,
+  height: number,
   passTarget: Float32Array,
   achieved: Float32Array,
+  tangentX: Float32Array,
+  tangentY: Float32Array,
+  coherence: Float32Array,
   centerX: number,
   centerY: number,
-  angle: number,
-  length: number,
-  width: number,
+  initialAngle: number,
+  followWeight: number,
+  totalLength: number,
+  brushWidth: number,
   threshold: number,
   rng: SeededRandom
 ): StrokePoint[] {
-  const { width: imageWidth, height } = target;
-  const directionX = Math.cos(angle);
-  const directionY = Math.sin(angle);
-  const normalX = -directionY;
-  const normalY = directionX;
-  const steps = Math.max(4, Math.min(13, Math.ceil(length / Math.max(1.8, width * 0.8))));
-  const bend = rng.range(-0.06, 0.06) * length;
-  const samples: Array<StrokePoint & { active: boolean }> = [];
+  const halfSteps = clamp(Math.ceil((totalLength * 0.5) / Math.max(1.6, brushWidth * 0.85)), 2, 8);
+  const stepLen = totalLength / (halfSteps * 2);
+  const subtleArc = rng.range(-0.04, 0.04);
 
-  for (let i = 0; i <= steps; i++) {
-    const u = i / steps;
-    const along = (u - 0.5) * length;
-    const curve = Math.sin((u - 0.5) * Math.PI) * bend;
-    const x = centerX + directionX * along + normalX * curve;
-    const y = centerY + directionY * along + normalY * curve;
-    if (x < 0.5 || y < 0.5 || x > imageWidth - 1.5 || y > height - 1.5) continue;
+  type RawSample = StrokePoint & { active: boolean };
 
-    const index = Math.round(y) * imageWidth + Math.round(x);
-    const residual = Math.max(0, passTarget[index] - achieved[index]);
-    const taper = Math.pow(Math.sin(Math.PI * clamp(u, 0.02, 0.98)), 0.45);
-    const pressure = clamp(0.16 + taper * (0.38 + residual * 0.62), 0.16, 1);
-    samples.push({
-      x: Math.round(x * 10) / 10,
-      y: Math.round(y * 10) / 10,
-      pressure,
-      active: residual > threshold * 0.32 || passTarget[index] > threshold * 1.35,
-    });
-  }
+  const marchHalf = (sign: 1 | -1): RawSample[] => {
+    const out: RawSample[] = [];
+    let x = centerX;
+    let y = centerY;
+    let dirX = Math.cos(initialAngle) * sign;
+    let dirY = Math.sin(initialAngle) * sign;
 
+    for (let s = 1; s <= halfSteps; s++) {
+      const idx =
+        clamp(Math.round(y), 0, height - 1) * width + clamp(Math.round(x), 0, width - 1);
+      const coh = coherence[idx] ?? 0;
+      const blend = followWeight * clamp01(coh * 1.4);
+
+      if (blend > 0.05) {
+        let fx = tangentX[idx];
+        let fy = tangentY[idx];
+        if (fx * dirX + fy * dirY < 0) {
+          fx = -fx;
+          fy = -fy;
+        }
+        dirX = dirX * (1 - blend) + fx * blend;
+        dirY = dirY * (1 - blend) + fy * blend;
+      }
+
+      const cosArc = Math.cos(subtleArc * sign);
+      const sinArc = Math.sin(subtleArc * sign);
+      const rx = dirX * cosArc - dirY * sinArc;
+      const ry = dirX * sinArc + dirY * cosArc;
+      const norm = Math.hypot(rx, ry) || 1;
+      dirX = rx / norm;
+      dirY = ry / norm;
+
+      x += dirX * stepLen;
+      y += dirY * stepLen;
+
+      if (x < 0.5 || y < 0.5 || x > width - 1.5 || y > height - 1.5) break;
+
+      const pIdx = Math.round(y) * width + Math.round(x);
+      const residual = Math.max(0, passTarget[pIdx] - achieved[pIdx]);
+      const u = 0.5 + (sign * s) / (halfSteps * 2);
+      const taper = Math.pow(Math.sin(Math.PI * clamp(u, 0.03, 0.97)), 0.48);
+      const pressure = clamp(0.16 + taper * (0.36 + residual * 0.64), 0.16, 1);
+
+      out.push({
+        x: Math.round(x * 10) / 10,
+        y: Math.round(y * 10) / 10,
+        pressure,
+        active: residual > threshold * 0.28 || passTarget[pIdx] > threshold * 1.25,
+      });
+    }
+    return out;
+  };
+
+  const centerIdx =
+    clamp(Math.round(centerY), 0, height - 1) * width +
+    clamp(Math.round(centerX), 0, width - 1);
+  const centerResidual = Math.max(0, passTarget[centerIdx] - achieved[centerIdx]);
+  const centerSample: RawSample = {
+    x: Math.round(centerX * 10) / 10,
+    y: Math.round(centerY * 10) / 10,
+    pressure: clamp(0.45 + centerResidual * 0.55, 0.22, 1),
+    active: true,
+  };
+
+  const backward = marchHalf(-1).reverse();
+  const forward = marchHalf(1);
+  const samples = [...backward, centerSample, ...forward];
   if (samples.length < 2) return [];
-  const center = Math.floor(samples.length / 2);
-  let seed = center;
-  while (seed > 0 && !samples[seed].active) seed--;
-  if (!samples[seed].active) {
-    seed = center + 1;
-    while (seed < samples.length && !samples[seed].active) seed++;
-  }
-  if (seed >= samples.length || !samples[seed].active) return [];
 
-  let start = seed;
-  let end = seed;
+  const seedIdx = backward.length;
+  let start = seedIdx;
+  let end = seedIdx;
   while (start > 0 && samples[start - 1].active) start--;
   while (end + 1 < samples.length && samples[end + 1].active) end++;
+
   if (end - start < 1) {
-    if (start > 0 && samples[start - 1]) start--;
+    if (start > 0) start--;
     else if (end + 1 < samples.length) end++;
   }
-  return samples.slice(start, end + 1).map(({ x, y, pressure }) => ({ x, y, pressure }));
+
+  const trimmed = samples.slice(start, end + 1);
+  if (trimmed.length < 2) return [];
+
+  return trimmed.map(({ x, y, pressure }) => ({ x, y, pressure }));
 }
 
-function rasterizeStroke(
-  achieved: Float32Array,
-  width: number,
-  height: number,
-  stroke: Stroke
-): void {
-  for (let p = 1; p < stroke.points.length; p++) {
-    const a = stroke.points[p - 1];
-    const b = stroke.points[p];
-    const distance = Math.hypot(b.x - a.x, b.y - a.y);
-    const steps = Math.max(1, Math.ceil(distance / 0.75));
-    for (let s = 0; s <= steps; s++) {
-      const t = s / steps;
-      const x = a.x + (b.x - a.x) * t;
-      const y = a.y + (b.y - a.y) * t;
-      const pressure = a.pressure + (b.pressure - a.pressure) * t;
-      const radius = Math.max(0.45, stroke.brush.width * pressure * 0.5);
-      depositDisk(achieved, width, height, x, y, radius, stroke.brush.opacity);
-    }
-  }
-}
-
-function depositDisk(
-  achieved: Float32Array,
-  width: number,
-  height: number,
-  cx: number,
-  cy: number,
-  radius: number,
-  opacity: number
-): void {
-  const minX = Math.max(0, Math.floor(cx - radius - 1));
-  const maxX = Math.min(width - 1, Math.ceil(cx + radius + 1));
-  const minY = Math.max(0, Math.floor(cy - radius - 1));
-  const maxY = Math.min(height - 1, Math.ceil(cy + radius + 1));
-  for (let y = minY; y <= maxY; y++) {
-    for (let x = minX; x <= maxX; x++) {
-      const distance = Math.hypot(x + 0.5 - cx, y + 0.5 - cy);
-      const coverage = clamp(radius + 0.55 - distance, 0, 1);
-      if (coverage <= 0) continue;
-      const index = y * width + x;
-      const alpha = opacity * coverage;
-      achieved[index] = 1 - (1 - achieved[index]) * (1 - alpha);
-    }
-  }
-}
-
-function localResidual(
+function computeLocalResidual(
   target: Float32Array,
   achieved: Float32Array,
   width: number,
@@ -318,21 +428,18 @@ function localResidual(
   const cy = Math.round(y);
   let sum = 0;
   let weightSum = 0;
+
   for (let dy = -r; dy <= r; dy++) {
     const py = cy + dy;
     if (py < 0 || py >= height) continue;
+    const row = py * width;
     for (let dx = -r; dx <= r; dx++) {
       const px = cx + dx;
       if (px < 0 || px >= width) continue;
       const weight = 1 / (1 + dx * dx + dy * dy);
-      const index = py * width + px;
-      sum += Math.max(0, target[index] - achieved[index]) * weight;
+      sum += Math.max(0, target[row + px] - achieved[row + px]) * weight;
       weightSum += weight;
     }
   }
   return sum / Math.max(1e-6, weightSum);
-}
-
-function clamp(value: number, low: number, high: number): number {
-  return value < low ? low : value > high ? high : value;
 }

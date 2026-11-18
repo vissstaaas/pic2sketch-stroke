@@ -1,4 +1,9 @@
-import type { PlaybackFrameState, PlaybackStatus, StrokeScript } from '../../types/stroke';
+import type {
+  PlaybackFrameState,
+  PlaybackStatus,
+  StrokeLayer,
+  StrokeScript,
+} from '../../types/stroke';
 import type { SketchCanvasEngine } from '../canvas/SketchCanvasEngine';
 
 export interface PlaybackControllerOptions {
@@ -17,6 +22,7 @@ export class PlaybackController {
   private currentStrokeIndex = 0;
   private currentStrokeProgress = 0;
   private speed = 1.0;
+  private errorMessage?: string;
   private onStateChange: (state: PlaybackFrameState) => void;
   private onComplete?: () => void;
   private onError?: (error: Error) => void;
@@ -41,6 +47,7 @@ export class PlaybackController {
     this.script = script;
     this.currentStrokeIndex = 0;
     this.currentStrokeProgress = 0;
+    this.errorMessage = undefined;
     this.status = 'ready';
     this.engine.loadScript(script);
     this.emitState();
@@ -49,12 +56,13 @@ export class PlaybackController {
   play(): void {
     if (!this.script || this.script.strokes.length === 0) return;
 
-    if (this.status === 'completed') {
+    if (this.status === 'completed' || this.status === 'error') {
       this.replay();
       return;
     }
 
     if (this.status === 'paused' || this.status === 'ready') {
+      this.errorMessage = undefined;
       this.status = 'playing';
       this.lastFrameTimestamp = performance.now();
       this.emitState();
@@ -80,6 +88,7 @@ export class PlaybackController {
     this.stopLoop();
     this.currentStrokeIndex = 0;
     this.currentStrokeProgress = 0;
+    this.errorMessage = undefined;
     this.engine.clear();
     this.engine.drawPaperBackground();
     this.status = 'playing';
@@ -93,8 +102,17 @@ export class PlaybackController {
 
     const clamped = Math.max(0, Math.min(1, targetProgress));
     const total = this.script.strokes.length;
-    const strokeIndex = Math.min(total - 1, Math.floor(clamped * total));
 
+    if (clamped <= 0) {
+      this.currentStrokeIndex = 0;
+      this.currentStrokeProgress = 0;
+      this.engine.drawUntil(-1);
+      if (this.status === 'completed') this.status = 'paused';
+      this.emitState();
+      return;
+    }
+
+    const strokeIndex = Math.min(total - 1, Math.floor(clamped * total));
     this.currentStrokeIndex = strokeIndex;
     this.currentStrokeProgress = 1.0;
 
@@ -111,6 +129,55 @@ export class PlaybackController {
     this.emitState();
   }
 
+  /** Steps forward or backward by an exact stroke count, pausing active playback. */
+  stepStrokes(delta: number): void {
+    if (!this.script || this.script.strokes.length === 0 || delta === 0) return;
+    this.stopLoop();
+
+    const total = this.script.strokes.length;
+    const completedCount =
+      this.currentStrokeProgress >= 1 ? this.currentStrokeIndex + 1 : this.currentStrokeIndex;
+    const nextCompletedCount = Math.max(0, Math.min(total, completedCount + Math.trunc(delta)));
+
+    if (nextCompletedCount === 0) {
+      this.currentStrokeIndex = 0;
+      this.currentStrokeProgress = 0;
+      this.status = 'paused';
+      this.engine.drawUntil(-1);
+    } else {
+      this.currentStrokeIndex = nextCompletedCount - 1;
+      this.currentStrokeProgress = 1.0;
+      this.engine.drawUntil(this.currentStrokeIndex);
+      if (nextCompletedCount >= total) {
+        this.status = 'completed';
+        this.onComplete?.();
+      } else {
+        this.status = 'paused';
+      }
+    }
+
+    this.emitState();
+  }
+
+  /** Seeks directly to the completion of a given drawing layer. */
+  seekToLayerEnd(layer: StrokeLayer): void {
+    if (!this.script || this.script.strokes.length === 0) return;
+    let lastIndex = -1;
+    for (let i = 0; i < this.script.strokes.length; i++) {
+      if (this.script.strokes[i].layer === layer) {
+        lastIndex = i;
+      }
+    }
+    if (lastIndex < 0) return;
+
+    this.stopLoop();
+    this.currentStrokeIndex = lastIndex;
+    this.currentStrokeProgress = 1.0;
+    this.engine.drawUntil(lastIndex);
+    this.status = lastIndex >= this.script.strokes.length - 1 ? 'completed' : 'paused';
+    this.emitState();
+  }
+
   setSpeed(newSpeed: number): void {
     this.speed = Math.max(0.1, Math.min(32, newSpeed));
     this.emitState();
@@ -119,8 +186,12 @@ export class PlaybackController {
   getState(): PlaybackFrameState {
     const total = this.script ? this.script.strokes.length : 0;
     let progress = 0;
-    if (total > 0) {
+    let activeLayer: StrokeLayer | undefined;
+
+    if (total > 0 && this.script) {
       progress = Math.min(1, (this.currentStrokeIndex + this.currentStrokeProgress) / total);
+      const safeIdx = Math.min(total - 1, Math.max(0, this.currentStrokeIndex));
+      activeLayer = this.script.strokes[safeIdx]?.layer;
     }
 
     return {
@@ -130,6 +201,8 @@ export class PlaybackController {
       totalStrokes: total,
       progress,
       speed: this.speed,
+      activeLayer,
+      errorMessage: this.errorMessage,
     };
   }
 
@@ -137,18 +210,18 @@ export class PlaybackController {
     this.onStateChange(this.getState());
   }
 
-  /** ~75 seconds for the whole drawing at 1x, clamped to a sane range. */
   private baseStrokesPerSecond(): number {
     const total = this.script ? this.script.strokes.length : 0;
     if (total <= 0) return 35;
-    return Math.max(30, Math.min(300, total / 75));
+    return Math.max(30, Math.min(320, total / 68));
   }
 
   private getRaf(): (callback: FrameRequestCallback) => number {
     if (typeof requestAnimationFrame !== 'undefined') {
       return requestAnimationFrame;
     }
-    return (cb: FrameRequestCallback) => setTimeout(() => cb(performance.now()), 16) as unknown as number;
+    return (cb: FrameRequestCallback) =>
+      setTimeout(() => cb(performance.now()), 16) as unknown as number;
   }
 
   private getCaf(): (handle: number) => void {
@@ -197,11 +270,10 @@ export class PlaybackController {
       const elapsedMs = Math.min(100, Math.max(1, timestamp - this.lastFrameTimestamp));
       this.lastFrameTimestamp = timestamp;
 
-      // Advance at a rate that finishes the drawing in a watchable time whatever
-      // the script size is (a 6000 stroke script at a fixed 35/s took 3 minutes).
       const strokesToAdvance = this.baseStrokesPerSecond() * (elapsedMs / 1000.0) * this.speed;
+      const nextPosition =
+        this.currentStrokeIndex + this.currentStrokeProgress + strokesToAdvance;
 
-      const nextPosition = this.currentStrokeIndex + this.currentStrokeProgress + strokesToAdvance;
       if (nextPosition >= totalStrokes) {
         this.currentStrokeIndex = totalStrokes - 1;
         this.currentStrokeProgress = 1.0;
@@ -220,6 +292,7 @@ export class PlaybackController {
       this.status = 'error';
       this.stopLoop();
       const errorObj = err instanceof Error ? err : new Error(String(err));
+      this.errorMessage = errorObj.message;
       this.onError?.(errorObj);
       this.emitState();
     }

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { PlaybackFrameState, StrokeScript } from '../types/stroke';
 import type { SketchCanvasEngine } from '../lib/canvas/SketchCanvasEngine';
 import { PlaybackController } from '../lib/playback/PlaybackController';
+import type { PlaybackFrameState, StrokeLayer, StrokeScript } from '../types/stroke';
 
 const INITIAL_STATE: PlaybackFrameState = {
   status: 'idle',
@@ -12,14 +12,20 @@ const INITIAL_STATE: PlaybackFrameState = {
   speed: 1.0,
 };
 
+const PRESET_SPEED_MAP: Record<'slow' | 'normal' | 'fast', number> = {
+  slow: 0.5,
+  normal: 1.0,
+  fast: 4.0,
+};
+
 export function useSketchPlayback(
   engine: SketchCanvasEngine | null,
   script: StrokeScript | null
 ) {
   const [playbackState, setPlaybackState] = useState<PlaybackFrameState>(INITIAL_STATE);
   const controllerRef = useRef<PlaybackController | null>(null);
+  const speedRef = useRef<number>(1.0);
 
-  // Initialize or reload controller when engine or script changes
   useEffect(() => {
     if (!engine) {
       controllerRef.current?.dispose();
@@ -28,26 +34,40 @@ export function useSketchPlayback(
       return;
     }
 
-    if (!controllerRef.current) {
-      controllerRef.current = new PlaybackController({
-        engine,
-        initialSpeed: playbackState.speed,
-        onStateChange: (newState) => {
-          setPlaybackState(newState);
-        },
-      });
-    }
-
-    if (script) {
-      controllerRef.current.load(script);
-    } else {
-      setPlaybackState(INITIAL_STATE);
-    }
+    const controller = new PlaybackController({
+      engine,
+      initialSpeed: speedRef.current,
+      onStateChange: (nextState) => {
+        speedRef.current = nextState.speed;
+        setPlaybackState(nextState);
+      },
+      onError: (err) => {
+        console.error('[PlaybackController] Rendering failure:', err);
+      },
+    });
+    controllerRef.current = controller;
 
     return () => {
-      controllerRef.current?.dispose();
-      controllerRef.current = null;
+      controller.dispose();
+      if (controllerRef.current === controller) {
+        controllerRef.current = null;
+      }
     };
+  }, [engine]);
+
+  useEffect(() => {
+    const controller = controllerRef.current;
+    if (!controller) return;
+
+    if (script) {
+      const preset = script.generation.options.speedPreset;
+      if (preset && PRESET_SPEED_MAP[preset]) {
+        controller.setSpeed(PRESET_SPEED_MAP[preset]);
+      }
+      controller.load(script);
+    } else {
+      setPlaybackState((prev) => ({ ...INITIAL_STATE, speed: prev.speed }));
+    }
   }, [engine, script]);
 
   const play = useCallback(() => {
@@ -70,13 +90,22 @@ export function useSketchPlayback(
     controllerRef.current?.seek(progress);
   }, []);
 
+  const stepStrokes = useCallback((delta: number) => {
+    controllerRef.current?.stepStrokes(delta);
+  }, []);
+
+  const seekToLayerEnd = useCallback((layer: StrokeLayer) => {
+    controllerRef.current?.seekToLayerEnd(layer);
+  }, []);
+
   const setSpeed = useCallback((speed: number) => {
+    speedRef.current = speed;
     controllerRef.current?.setSpeed(speed);
   }, []);
 
   const exportPng = useCallback((): string => {
     if (!engine) {
-      throw new Error('画板尚未就绪，无法导出图片');
+      throw new Error('画板尚未就绪，无法导出 PNG');
     }
     return engine.exportPng();
   }, [engine]);
@@ -88,6 +117,8 @@ export function useSketchPlayback(
     resume,
     replay,
     seek,
+    stepStrokes,
+    seekToLayerEnd,
     setSpeed,
     exportPng,
   };

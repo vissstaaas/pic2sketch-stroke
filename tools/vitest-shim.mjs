@@ -62,6 +62,7 @@ const MATCHERS = {
   toBeCloseTo: (a, e, digits = 2) => Math.abs(a - e) < Math.pow(10, -digits) / 2,
   toHaveLength: (a, e) => a != null && a.length === e,
   toContain: (a, e) => a != null && typeof a.includes === 'function' && a.includes(e),
+  toBeInstanceOf: (a, e) => a instanceof e,
   toMatch: (a, e) => new RegExp(e).test(a),
   toHaveBeenCalled: (a) => (a?.mock?.calls?.length ?? 0) > 0,
   toHaveBeenCalledWith: (a, ...e) => (a?.mock?.calls ?? []).some((call) => deepEqual(call, e)),

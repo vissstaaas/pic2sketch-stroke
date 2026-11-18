@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { SketchCanvasEngine } from '../lib/canvas/SketchCanvasEngine';
-import type { PlaybackFrameState, StrokeScript } from '../types/stroke';
+import type { PlaybackFrameState, StrokeLayer, StrokeScript } from '../types/stroke';
 
 class FakeContext {
   fillStyle = '';
@@ -8,6 +8,7 @@ class FakeContext {
   lineWidth = 1;
   lineCap = 'round';
   lineJoin = 'round';
+  globalAlpha = 1;
   private ink = 0;
 
   setTransform(): void {}
@@ -18,7 +19,6 @@ class FakeContext {
     this.ink = 0;
   }
   fillRect(): void {}
-  globalAlpha = 1;
   beginPath(): void {}
   moveTo(): void {}
   lineTo(): void {}
@@ -62,10 +62,17 @@ class FakeCanvas {
 }
 
 function createScript(): StrokeScript {
+  const layers: StrokeLayer[] = ['outline', 'darkTone'];
   return {
     version: '1.0',
-    sourceImage: { width: 40, height: 40, processedWidth: 40, processedHeight: 40, mimeType: 'image/png' },
-    canvas: { width: 40, height: 40, background: '#fbf9f5', padding: 0 },
+    sourceImage: {
+      width: 40,
+      height: 40,
+      processedWidth: 40,
+      processedHeight: 40,
+      mimeType: 'image/png',
+    },
+    canvas: { width: 40, height: 40, background: '#fbf8f1', padding: 0 },
     generation: {
       seed: 7,
       createdAt: new Date(0).toISOString(),
@@ -74,14 +81,15 @@ function createScript(): StrokeScript {
     },
     strokes: [0, 1].map((order) => ({
       id: `stroke-${order}`,
-      kind: 'contour' as const,
-      layer: 'outline' as const,
+      kind: order === 0 ? ('contour' as const) : ('crossHatching' as const),
+      layer: layers[order],
       order,
       points: [
         { x: 4 + order * 10, y: 6, pressure: 0.5 },
+        { x: 15 + order * 10, y: 15, pressure: 0.7 },
         { x: 26 + order * 10, y: 24, pressure: 0.8 },
       ],
-      brush: { width: 1.5, opacity: 0.5, hardness: 0.6, grain: 0.4, jitter: 0.2 },
+      brush: { width: 1.5, opacity: 0.5, hardness: 0.6, grain: 0.3, jitter: 0.2 },
       durationMs: 100,
       priority: 1,
       sourceConfidence: 1,
@@ -100,10 +108,15 @@ function frame(currentStrokeIndex: number, currentStrokeProgress: number): Playb
   };
 }
 
-describe('SketchCanvasEngine frame caching', () => {
+describe('SketchCanvasEngine frame caching and layer filtering', () => {
   it('does not accumulate the active stroke when the same partial frame is rendered repeatedly', () => {
     const canvas = new FakeCanvas();
-    const engine = new SketchCanvasEngine({ canvas: canvas as unknown as HTMLCanvasElement, width: 40, height: 40, pixelRatio: 1 });
+    const engine = new SketchCanvasEngine({
+      canvas: canvas as unknown as HTMLCanvasElement,
+      width: 40,
+      height: 40,
+      pixelRatio: 1,
+    });
     engine.loadScript(createScript());
 
     engine.renderFrame(frame(0, 0.45));
@@ -115,7 +128,12 @@ describe('SketchCanvasEngine frame caching', () => {
 
   it('keeps completed frames idempotent and exports the current canvas', () => {
     const canvas = new FakeCanvas();
-    const engine = new SketchCanvasEngine({ canvas: canvas as unknown as HTMLCanvasElement, width: 40, height: 40, pixelRatio: 1 });
+    const engine = new SketchCanvasEngine({
+      canvas: canvas as unknown as HTMLCanvasElement,
+      width: 40,
+      height: 40,
+      pixelRatio: 1,
+    });
     engine.loadScript(createScript());
 
     engine.renderFrame(frame(0, 1));
@@ -132,7 +150,12 @@ describe('SketchCanvasEngine frame caching', () => {
 
   it('extends the completed snapshot when playback jumps across strokes', () => {
     const canvas = new FakeCanvas();
-    const engine = new SketchCanvasEngine({ canvas: canvas as unknown as HTMLCanvasElement, width: 40, height: 40, pixelRatio: 1 });
+    const engine = new SketchCanvasEngine({
+      canvas: canvas as unknown as HTMLCanvasElement,
+      width: 40,
+      height: 40,
+      pixelRatio: 1,
+    });
     engine.loadScript(createScript());
 
     engine.renderFrame(frame(1, 0.5));
@@ -141,5 +164,24 @@ describe('SketchCanvasEngine frame caching', () => {
 
     expect(jumpedInk).toBeGreaterThan(1);
     expect(canvas.context.getInk()).toBe(jumpedInk);
+  });
+
+  it('respects hidden layer visibility toggles without losing completed state', () => {
+    const canvas = new FakeCanvas();
+    const engine = new SketchCanvasEngine({
+      canvas: canvas as unknown as HTMLCanvasElement,
+      width: 40,
+      height: 40,
+      pixelRatio: 1,
+    });
+    engine.loadScript(createScript());
+    engine.drawUntil(1);
+    expect(canvas.context.getInk()).toBe(2);
+
+    engine.setHiddenLayers(new Set(['darkTone']));
+    expect(canvas.context.getInk()).toBe(1);
+
+    engine.setHiddenLayers(new Set());
+    expect(canvas.context.getInk()).toBe(2);
   });
 });

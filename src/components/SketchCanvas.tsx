@@ -1,5 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import { SketchCanvasEngine } from '../lib/canvas/SketchCanvasEngine';
+import { PAPER_BACKGROUND } from '../lib/strokes/reconstructSketchScript';
 
 interface SketchCanvasProps {
   width: number;
@@ -14,28 +15,34 @@ export const SketchCanvas: React.FC<SketchCanvasProps> = ({
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const engineRef = useRef<SketchCanvasEngine | null>(null);
+  const initialSizeRef = useRef({ width, height });
 
   useEffect(() => {
     if (!canvasRef.current) return;
 
-    if (!engineRef.current) {
-      const engine = new SketchCanvasEngine({
-        canvas: canvasRef.current,
-        width,
-        height,
-        background: '#fbf9f5',
-      });
-      engineRef.current = engine;
-      onEngineReady(engine);
-    } else {
-      engineRef.current.resize(width, height);
-    }
-  }, [width, height, onEngineReady]);
+    const engine = new SketchCanvasEngine({
+      canvas: canvasRef.current,
+      width: initialSizeRef.current.width,
+      height: initialSizeRef.current.height,
+      background: PAPER_BACKGROUND,
+    });
+    engineRef.current = engine;
+    onEngineReady(engine);
+
+    return () => {
+      engine.dispose();
+      engineRef.current = null;
+    };
+  }, [onEngineReady]);
+
+  useEffect(() => {
+    engineRef.current?.resize(width, height);
+  }, [width, height]);
 
   return (
     <div className="canvas-wrapper">
       <div className="canvas-easel-frame">
-        <canvas ref={canvasRef} className="sketch-canvas" />
+        <canvas ref={canvasRef} className="sketch-canvas" aria-label="铅笔素描逐笔绘制画布" />
       </div>
     </div>
   );

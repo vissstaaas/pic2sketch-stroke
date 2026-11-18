@@ -1,4 +1,4 @@
-import type { PlaybackFrameState, Stroke, StrokeScript } from '../../types/stroke';
+import type { PlaybackFrameState, Stroke, StrokeLayer, StrokeScript } from '../../types/stroke';
 import { PencilBrush } from './PencilBrush';
 
 export interface SketchCanvasEngineOptions {
@@ -14,10 +14,6 @@ export interface DrawStrokeOptions {
   speedScale?: number;
 }
 
-/**
- * Self-contained 2D Canvas rendering engine for stroke-by-stroke pencil sketch playback.
- * Does NOT reveal a pre-rendered final image or use masks; renders authentic strokes deterministically.
- */
 export class SketchCanvasEngine {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
@@ -30,18 +26,20 @@ export class SketchCanvasEngine {
   private renderedStrokeIndex = -1;
   private baseImageData: ImageData | null = null;
   private baseStrokeIndex = -1;
+  private hiddenLayers = new Set<StrokeLayer>();
 
   constructor(options: SketchCanvasEngineOptions) {
     this.canvas = options.canvas;
     const context = this.canvas.getContext('2d', { willReadFrequently: true });
     if (!context) {
-      throw new Error('无法初始化 Canvas 2D 上下文');
+      throw new Error('无法初始化 Canvas 2D 渲染上下文');
     }
     this.ctx = context;
     this.width = options.width;
     this.height = options.height;
-    this.pixelRatio = options.pixelRatio || (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
-    this.background = options.background || '#fbf9f5';
+    this.pixelRatio =
+      options.pixelRatio || (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
+    this.background = options.background || '#fbf8f1';
     this.brush = new PencilBrush();
 
     this.applySize();
@@ -50,7 +48,6 @@ export class SketchCanvasEngine {
   }
 
   private applySize(): void {
-    // Resizing resets the backing store, so any cached base frame is invalid.
     this.invalidateBaseSnapshot();
     this.canvas.width = Math.round(this.width * this.pixelRatio);
     this.canvas.height = Math.round(this.height * this.pixelRatio);
@@ -74,6 +71,21 @@ export class SketchCanvasEngine {
     this.captureBaseSnapshot();
   }
 
+  setHiddenLayers(layers: ReadonlySet<StrokeLayer>): void {
+    this.hiddenLayers = new Set(layers);
+    const target = this.renderedStrokeIndex;
+    this.invalidateBaseSnapshot();
+    if (this.script) {
+      this.drawUntil(target);
+    } else {
+      this.drawPaperBackground();
+    }
+  }
+
+  getHiddenLayers(): ReadonlySet<StrokeLayer> {
+    return this.hiddenLayers;
+  }
+
   clear(): void {
     this.ctx.clearRect(0, 0, this.width, this.height);
     this.renderedStrokeIndex = -1;
@@ -83,26 +95,45 @@ export class SketchCanvasEngine {
   drawPaperBackground(): void {
     this.invalidateBaseSnapshot();
     this.ctx.save();
-    // Warm, natural sketch paper background
     this.ctx.fillStyle = this.background;
     this.ctx.fillRect(0, 0, this.width, this.height);
 
-    // Subtle paper tooth texture
-    this.ctx.fillStyle = 'rgba(0, 0, 0, 0.015)';
     const seed = this.script?.generation.seed || 42;
-    const step = 8;
-    for (let y = 0; y < this.height; y += step) {
-      for (let x = 0; x < this.width; x += step) {
-        if (((x * 17 + y * 31 + seed) % 100) > 65) {
-          this.ctx.fillRect(x, y, 1, 1);
+    const grain = this.script?.generation.options.paperGrain ?? 0.35;
+    if (grain > 0.02) {
+      const darkSpeckAlpha = (0.008 + grain * 0.016).toFixed(4);
+      const warmFiberAlpha = (0.006 + grain * 0.012).toFixed(4);
+      const step = 7;
+
+      this.ctx.fillStyle = `rgba(42, 36, 30, ${darkSpeckAlpha})`;
+      for (let y = 0; y < this.height; y += step) {
+        for (let x = 0; x < this.width; x += step) {
+          const hash = ((x * 73856093) ^ (y * 19349663) ^ seed) >>> 0;
+          if ((hash % 100) < 28) {
+            const ox = hash % 5;
+            const oy = (hash >>> 4) % 5;
+            this.ctx.fillRect(x + ox, y + oy, 1, 1);
+          }
+        }
+      }
+
+      this.ctx.fillStyle = `rgba(140, 122, 98, ${warmFiberAlpha})`;
+      for (let y = 3; y < this.height; y += step * 2) {
+        for (let x = 2; x < this.width; x += step * 2) {
+          const hash = ((x * 83492791) ^ (y * 2971215073) ^ (seed + 17)) >>> 0;
+          if ((hash % 100) < 22) {
+            this.ctx.fillRect(x, y, 2, 1);
+          }
         }
       }
     }
+
     this.ctx.restore();
     this.captureBaseSnapshot();
   }
 
   drawStroke(stroke: Stroke, options?: DrawStrokeOptions): void {
+    if (this.hiddenLayers.has(stroke.layer)) return;
     const progress = options?.progress ?? 1.0;
     const seed = (this.script?.generation.seed || 100) + stroke.order * 37;
 
@@ -116,38 +147,30 @@ export class SketchCanvasEngine {
     });
   }
 
-  /**
-   * Redraws all strokes from 0 up to target stroke index.
-   */
   drawUntil(targetIndex: number): void {
     this.clear();
     this.drawPaperBackground();
 
-    if (!this.script || this.script.strokes.length === 0) {
+    if (!this.script || this.script.strokes.length === 0 || targetIndex < 0) {
       return;
     }
 
-    const clampedTarget = Math.max(-1, Math.min(this.script.strokes.length - 1, targetIndex));
+    const clampedTarget = Math.min(this.script.strokes.length - 1, targetIndex);
     for (let i = 0; i <= clampedTarget; i++) {
-      const stroke = this.script.strokes[i];
-      this.drawStroke(stroke, { progress: 1.0 });
+      this.drawStroke(this.script.strokes[i], { progress: 1.0 });
     }
 
     this.renderedStrokeIndex = clampedTarget;
     this.captureBaseSnapshot();
   }
 
-  /**
-   * Called on every playback tick. The completed-strokes snapshot is restored
-   * before drawing the active stroke so partial frames never accumulate ink.
-   */
   renderFrame(state: PlaybackFrameState): void {
     if (!this.script || this.script.strokes.length === 0) return;
 
     const requestedIndex = Number.isFinite(state.currentStrokeIndex)
       ? Math.trunc(state.currentStrokeIndex)
       : 0;
-    if (requestedIndex < 0) {
+    if (requestedIndex < 0 || (requestedIndex === 0 && state.currentStrokeProgress <= 0)) {
       this.drawUntil(-1);
       return;
     }
@@ -163,8 +186,6 @@ export class SketchCanvasEngine {
       return;
     }
 
-    // A playback tick may jump across many short strokes. Extend the cached
-    // completed frame incrementally, then draw only the current partial stroke.
     this.ensureCompletedBase(completedBeforeIndex);
 
     const currentStroke = this.script.strokes[currentStrokeIndex];
@@ -209,8 +230,6 @@ export class SketchCanvasEngine {
       this.baseImageData = this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
       this.baseStrokeIndex = this.renderedStrokeIndex;
     } catch {
-      // ImageData may be unavailable in a constrained test/runtime context.
-      // Playback remains correct by rebuilding from the script when needed.
       this.invalidateBaseSnapshot();
     }
   }
@@ -237,8 +256,7 @@ export class SketchCanvasEngine {
 
     if (this.baseImageData && this.baseStrokeIndex < target) {
       const start = this.baseStrokeIndex + 1;
-      const restored = this.restoreBaseSnapshot(this.baseStrokeIndex);
-      if (restored) {
+      if (this.restoreBaseSnapshot(this.baseStrokeIndex)) {
         for (let i = start; i <= target; i++) {
           this.drawStroke(this.script.strokes[i], { progress: 1 });
         }

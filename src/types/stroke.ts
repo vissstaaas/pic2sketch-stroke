@@ -17,6 +17,8 @@ export type StrokeLayer =
   | 'darkTone'
   | 'finalAccent';
 
+export type PencilGrade = '2H' | 'HB' | '2B' | '4B' | '6B';
+
 export interface StrokePoint {
   x: number;
   y: number;
@@ -30,6 +32,7 @@ export interface BrushStyle {
   hardness: number;
   grain: number;
   jitter: number;
+  grade?: PencilGrade;
 }
 
 export interface Stroke {
@@ -47,8 +50,18 @@ export interface Stroke {
 export interface SketchTargetPreview {
   width: number;
   height: number;
-  /** White-paper grayscale pixels: 0 is black graphite and 255 is paper. */
+  /** 0 corresponds to deep graphite black, 255 to untouched paper. */
   pixels: Uint8ClampedArray;
+}
+
+export interface StrokeLayerMetrics {
+  structure: number;
+  outline: number;
+  features: number;
+  lightTone: number;
+  midTone: number;
+  darkTone: number;
+  finalAccent: number;
 }
 
 export interface StrokeScript {
@@ -71,8 +84,9 @@ export interface StrokeScript {
     createdAt: string;
     options: StrokeGenerationOptions;
     strokeCount: number;
+    layerMetrics?: StrokeLayerMetrics;
+    elapsedMs?: number;
   };
-  /** Diagnostic-only target image. It is never drawn into the playback canvas. */
   targetPreview?: SketchTargetPreview;
   strokes: Stroke[];
 }
@@ -92,4 +106,6 @@ export interface PlaybackFrameState {
   totalStrokes: number;
   progress: number;
   speed: number;
+  activeLayer?: StrokeLayer;
+  errorMessage?: string;
 }

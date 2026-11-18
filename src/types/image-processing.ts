@@ -8,47 +8,7 @@ export interface UploadImageMeta {
   height: number;
 }
 
-export interface ImageMap {
-  width: number;
-  height: number;
-  data: Float32Array;
-}
-
-export interface GradientMap {
-  width: number;
-  height: number;
-  magnitude: Float32Array;
-  angle: Float32Array;
-}
-
-export interface PreprocessedImage {
-  width: number;
-  height: number;
-  grayscaleMap: ImageMap;
-  edgeMap: ImageMap;
-  toneMap: ImageMap;
-  saliencyMap: ImageMap;
-  gradientMap: GradientMap;
-  /**
-   * Soft foreground confidence map. Values near 0 are background pixels and
-   * values near 1 belong to the main subject. Kept optional for compatibility
-   * with hand-built test fixtures and older scripts.
-   */
-  foregroundMap?: ImageMap;
-  /**
-   * Coherent edge tangent (flow) field. 'angle' is the local form direction,
-   * 'coherence' is how reliable that direction is (0 isotropic, 1 strongly
-   * oriented) and 'scale' is the structure tensor sigma it was measured at.
-   * Hatching and hair strands follow this field instead of a fixed angle.
-   */
-  flowMap?: {
-    width: number;
-    height: number;
-    angle: Float32Array;
-    coherence: Float32Array;
-    scale: Float32Array;
-  };
-}
+export type SketchStylePreset = 'classic' | 'portrait' | 'lineart' | 'dramatic';
 
 export interface StrokeGenerationOptions {
   maxProcessingSize: number;
@@ -59,10 +19,14 @@ export interface StrokeGenerationOptions {
   minStrokeLength: number;
   maxStrokeLength: number;
   speedPreset: 'slow' | 'normal' | 'fast';
+  stylePreset?: SketchStylePreset;
+  paperGrain?: number;
+  seed?: number;
 }
 
 export type StrokeWorkerPhase =
   | 'preprocessing'
+  | 'structure'
   | 'contours'
   | 'shading'
   | 'ordering'

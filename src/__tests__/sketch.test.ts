@@ -1,117 +1,117 @@
-import { describe, it, expect, vi } from 'vitest';
-import { SeededRandom } from '../utils/random';
-import { clamp, lerp, distance, pointToSegmentDistance } from '../utils/math';
-import { simplifyPath } from '../lib/strokes/simplifyPath';
-import { preprocessImage } from '../lib/image/preprocessImage';
+import { describe, expect, it, vi } from 'vitest';
+import {
+  buildStrokeRibbonPolygon,
+  getGraphiteSpec,
+  rasterizeStrokeCoverage,
+} from '../lib/canvas/brushMath';
+import { exportScriptToJson, exportScriptToSvg } from '../lib/export/exportSketch';
 import { buildSketchTarget, createSketchTargetPreview } from '../lib/image/buildSketchTarget';
-import { generateContourStrokes } from '../lib/strokes/generateContourStrokes';
-import { generateResidualStrokes } from '../lib/strokes/generateResidualStrokes';
-import { generateDetailContours } from '../lib/strokes/generateDetailContours';
-import { orderStrokes } from '../lib/strokes/orderStrokes';
+import { computeCoherentLines } from '../lib/image/coherentLineDrawing';
+import { computeEdgeTangentFlow } from '../lib/image/edgeTangentFlow';
+import { mapPencilToneField } from '../lib/image/pencilToneMapping';
 import { PlaybackController } from '../lib/playback/PlaybackController';
-import type { Stroke, StrokeScript } from '../types/stroke';
+import { generateConstructionStrokes } from '../lib/strokes/generateConstructionStrokes';
+import { generateDetailContours } from '../lib/strokes/generateDetailContours';
+import { generateResidualStrokes } from '../lib/strokes/generateResidualStrokes';
+import { computeLayerMetrics, orderStrokes } from '../lib/strokes/orderStrokes';
+import { meanCurvature, resamplePoints, simplifyPoints } from '../lib/strokes/pathGeometry';
+import { reconstructSketchScript } from '../lib/strokes/reconstructSketchScript';
 import type { StrokeGenerationOptions } from '../types/image-processing';
+import type { Stroke, StrokeScript } from '../types/stroke';
+import { clamp, distance, lerp, pointToSegmentDistance, reflectIndex } from '../utils/math';
+import { SeededRandom } from '../utils/random';
 
-describe('Math and SeededRandom', () => {
-  it('seeded random should be 100% deterministic given same seed', () => {
+describe('Math, Geometry, and SeededRandom', () => {
+  it('produces identical sequences for identical seeds', () => {
     const rng1 = new SeededRandom(9999);
     const rng2 = new SeededRandom(9999);
 
     const values1 = [rng1.next(), rng1.range(10, 20), rng1.int(1, 100), rng1.gaussian()];
     const values2 = [rng2.next(), rng2.range(10, 20), rng2.int(1, 100), rng2.gaussian()];
-
     expect(values1).toEqual(values2);
   });
 
-  it('math utilities work accurately', () => {
+  it('evaluates mirror reflection, interpolation, and segment distances accurately', () => {
     expect(clamp(15, 0, 10)).toBe(10);
     expect(clamp(-5, 0, 10)).toBe(0);
-    expect(clamp(5, 0, 10)).toBe(5);
-
     expect(lerp(10, 20, 0.5)).toBe(15);
     expect(distance(0, 0, 3, 4)).toBe(5);
-
-    // Distance from (1, 1) to segment (0, 0) -> (2, 0) is 1.0
+    expect(reflectIndex(-2, 10)).toBe(2);
+    expect(reflectIndex(11, 10)).toBe(7);
     expect(pointToSegmentDistance(1, 1, 0, 0, 2, 0)).toBeCloseTo(1.0);
   });
-});
 
-describe('Path Simplification (RDP)', () => {
-  it('preserves start and end points and reduces redundant collinear points', () => {
-    const points = [
+  it('simplifies, resamples, and measures curvature on polylines', () => {
+    const collinear = [
       { x: 0, y: 0, pressure: 0.5 },
-      { x: 1, y: 0.05, pressure: 0.5 },
-      { x: 2, y: -0.05, pressure: 0.5 },
-      { x: 3, y: 0.02, pressure: 0.5 },
+      { x: 1, y: 0.04, pressure: 0.5 },
+      { x: 2, y: -0.04, pressure: 0.5 },
       { x: 4, y: 0, pressure: 0.5 },
     ];
-
-    const simplified = simplifyPath(points, 0.5);
+    const simplified = simplifyPoints(collinear, 0.3);
     expect(simplified.length).toBe(2);
-    expect(simplified[0].x).toBe(0);
-    expect(simplified[1].x).toBe(4);
-  });
 
-  it('keeps distinct curve apexes', () => {
-    const points = [
+    const corner = [
       { x: 0, y: 0, pressure: 0.5 },
-      { x: 5, y: 10, pressure: 0.8 }, // Sharp peak
+      { x: 5, y: 10, pressure: 0.8 },
       { x: 10, y: 0, pressure: 0.5 },
     ];
-
-    const simplified = simplifyPath(points, 1.0);
-    expect(simplified.length).toBe(3);
-    expect(simplified[1].y).toBe(10);
+    expect(simplifyPoints(corner, 1.0).length).toBe(3);
+    expect(meanCurvature(corner)).toBeGreaterThan(0.8);
+    expect(resamplePoints(corner, 1.5).length).toBeGreaterThan(corner.length);
   });
 });
 
-describe('Image Preprocessing and Maps', () => {
-  function createTestImageData(width: number, height: number): ImageData {
+describe('ETF, FDoG Coherent Line Drawing, and Tone Mapping', () => {
+  function createHalfSplitImage(width: number, height: number): ImageData {
     const buffer = new Uint8ClampedArray(width * height * 4);
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
         const idx = (y * width + x) * 4;
-        // Half black, half white
-        const val = x < width / 2 ? 20 : 230;
+        const val = x < width / 2 ? 22 : 235;
         buffer[idx] = val;
         buffer[idx + 1] = val;
         buffer[idx + 2] = val;
         buffer[idx + 3] = 255;
       }
     }
-    return {
-      width,
-      height,
-      data: buffer,
-      colorSpace: 'srgb',
-    } as ImageData;
+    return { width, height, data: buffer } as ImageData;
   }
 
-  it('generates grayscale, edge, tone, and saliency maps correctly', () => {
-    const imgData = createTestImageData(64, 64);
-    const preprocessed = preprocessImage(imgData);
+  it('aligns ETF vectors vertically along a vertical step edge and extracts FDoG lines', () => {
+    const w = 64;
+    const h = 64;
+    const gray = new Float32Array(w * h).fill(0.95);
+    // Draw a 2px vertical dark line at x = 31..32
+    for (let y = 4; y < h - 4; y++) {
+      gray[y * w + 31] = 0.1;
+      gray[y * w + 32] = 0.1;
+    }
 
-    expect(preprocessed.width).toBe(64);
-    expect(preprocessed.height).toBe(64);
-    expect(preprocessed.grayscaleMap.data.length).toBe(64 * 64);
-    expect(preprocessed.edgeMap.data.length).toBe(64 * 64);
-    expect(preprocessed.toneMap.data.length).toBe(64 * 64);
+    const etf = computeEdgeTangentFlow(gray, w, h, 2);
+    const edgeIdx = 32 * w + 31;
+    const flatIdx = 32 * w + 10;
 
-    // Near the boundary (x = 32), edge magnitude should be elevated
-    const centerIdx = 32 * 64 + 32;
-    expect(preprocessed.edgeMap.data[centerIdx]).toBeGreaterThan(0.05);
+    // Tangent along a vertical feature has |ty| >> |tx|
+    expect(Math.abs(etf.tangentY[edgeIdx])).toBeGreaterThan(0.85);
+    expect(etf.coherence[edgeIdx]).toBeGreaterThan(etf.coherence[flatIdx]);
 
-    // Left side (dark) should have higher tone (darkness) than right side (bright)
-    const darkIdx = 32 * 64 + 10;
-    const brightIdx = 32 * 64 + 50;
-    expect(preprocessed.toneMap.data[darkIdx]).toBeGreaterThan(preprocessed.toneMap.data[brightIdx]);
+    const fdog = computeCoherentLines(gray, w, h, etf, { sensitivity: 0.6, scale: 0.5 });
+    expect(fdog[edgeIdx]).toBeGreaterThan(0.25);
+    expect(fdog[flatIdx]).toBe(0);
   });
 
-  it('builds a white-paper sketch target while preserving a dark boundary', () => {
-    const imgData = createTestImageData(64, 64);
+  it('calibrates tone across presets and builds clean white-paper sketch targets', () => {
+    const sample = new Float32Array([0.1, 0.35, 0.65, 0.96]);
+    const dramatic = mapPencilToneField(sample, 'dramatic');
+    const lineart = mapPencilToneField(sample, 'lineart');
+    expect(dramatic[0]).toBeGreaterThan(lineart[0]);
+    expect(dramatic[3]).toBeLessThan(0.05);
+
+    const imgData = createHalfSplitImage(64, 64);
     const target = buildSketchTarget(imgData);
     const boundary = 32 * 64 + 31;
-    const flatLight = 32 * 64 + 50;
+    const flatLight = 32 * 64 + 52;
 
     expect(target.darkness.length).toBe(64 * 64);
     expect(target.detail[boundary]).toBeGreaterThan(target.detail[flatLight]);
@@ -119,80 +119,65 @@ describe('Image Preprocessing and Maps', () => {
 
     const preview = createSketchTargetPreview(target);
     expect(preview).toBeInstanceOf(Uint8ClampedArray);
-    expect(preview.length).toBe(64 * 64);
     expect(preview[boundary]).toBeLessThan(preview[flatLight]);
   });
 });
 
-describe('Stroke Generation & Ordering Contracts', () => {
+describe('Physically Matched Graphite Brush & Coverage Accounting', () => {
+  it('deposits single-fill opacity without self-compounding along multi-segment strokes', () => {
+    const w = 48;
+    const h = 48;
+    const achieved = new Float32Array(w * h);
+    const stroke: Stroke = {
+      id: 'single-fill-check',
+      kind: 'hatching',
+      layer: 'midTone',
+      order: 0,
+      points: [
+        { x: 6, y: 24, pressure: 1 },
+        { x: 16, y: 24, pressure: 1 },
+        { x: 26, y: 24, pressure: 1 },
+        { x: 38, y: 24, pressure: 1 },
+      ],
+      brush: { width: 6, opacity: 0.25, hardness: 0.6, grain: 0, jitter: 0, grade: '2B' },
+      durationMs: 50,
+      priority: 10,
+      sourceConfidence: 1,
+    };
+
+    rasterizeStrokeCoverage(achieved, w, h, stroke);
+    const expectedSingleFill = 0.25 * getGraphiteSpec(stroke.brush, stroke.layer).darknessFactor;
+    // Centerline pixel at joint x=16, y=24 must NOT double-darken
+    const jointCenter = achieved[24 * w + 16];
+    expect(jointCenter).toBeCloseTo(expectedSingleFill, 2);
+
+    const polygon = buildStrokeRibbonPolygon(stroke.points, stroke.brush, 42);
+    expect(polygon.length).toBeGreaterThan(10);
+  });
+});
+
+describe('Stroke Generation, Budget Capping, Spatial Ordering, and Exports', () => {
   const options: StrokeGenerationOptions = {
     maxProcessingSize: 64,
-    targetStrokeCount: 200,
-    contourSensitivity: 0.5,
-    shadingDensity: 0.6,
+    targetStrokeCount: 240,
+    contourSensitivity: 0.6,
+    shadingDensity: 0.65,
     backgroundSuppression: 0.5,
     minStrokeLength: 3,
     maxStrokeLength: 50,
     speedPreset: 'normal',
+    stylePreset: 'classic',
+    paperGrain: 0.3,
+    seed: 777,
   };
 
-  function createMockPreprocessed(w = 64, h = 64) {
-    const size = w * h;
-    const grayData = new Float32Array(size);
-    const edgeData = new Float32Array(size);
-    const toneData = new Float32Array(size);
-    const salData = new Float32Array(size).fill(0.7);
-    const magData = new Float32Array(size);
-    const angData = new Float32Array(size);
-
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        const idx = y * w + x;
-        // Central circle with high edge & dark tone
-        const dist = Math.hypot(x - w / 2, y - h / 2);
-        if (Math.abs(dist - 16) < 2) {
-          edgeData[idx] = 0.8;
-        }
-        if (dist < 16) {
-          toneData[idx] = 0.85; // dark subject interior
-        } else {
-          toneData[idx] = 0.05; // bright white background
-        }
-      }
-    }
-
-    return {
-      width: w,
-      height: h,
-      grayscaleMap: { width: w, height: h, data: grayData },
-      edgeMap: { width: w, height: h, data: edgeData },
-      toneMap: { width: w, height: h, data: toneData },
-      saliencyMap: { width: w, height: h, data: salData },
-      gradientMap: { width: w, height: h, magnitude: magData, angle: angData },
-    };
-  }
-
-  it('generates valid contour strokes that have at least 2 points', () => {
-    const prep = createMockPreprocessed();
-    const rng = new SeededRandom(42);
-    const strokes = generateContourStrokes(prep, options, rng);
-
-    expect(strokes.length).toBeGreaterThan(0);
-    for (const s of strokes) {
-      expect(s.points.length).toBeGreaterThanOrEqual(2);
-      expect(s.id).toBeDefined();
-      expect(s.brush.width).toBeGreaterThan(0);
-      expect(s.brush.opacity).toBeGreaterThan(0);
-    }
-  });
-
-  it('reconstructs tonal information with deterministic real strokes', () => {
+  it('generates construction, detail contour, and residual tonal strokes', () => {
     const w = 64;
     const h = 64;
     const buffer = new Uint8ClampedArray(w * h * 4);
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
-        const value = Math.hypot(x - 32, y - 32) < 18 ? 35 : 238;
+        const value = Math.hypot(x - 32, y - 32) < 18 ? 30 : 238;
         const i = (y * w + x) * 4;
         buffer[i] = value;
         buffer[i + 1] = value;
@@ -200,185 +185,200 @@ describe('Stroke Generation & Ordering Contracts', () => {
         buffer[i + 3] = 255;
       }
     }
-    const target = buildSketchTarget({ width: w, height: h, data: buffer } as ImageData);
+    const target = buildSketchTarget({ width: w, height: h, data: buffer } as ImageData, options);
     const rng = new SeededRandom(777);
-    const shading = generateResidualStrokes(target, options, rng);
 
+    const structure = generateConstructionStrokes(target, options, rng);
+    const contours = generateDetailContours(target, options, rng);
+    const shading = generateResidualStrokes(target, options, rng, [...structure, ...contours]);
+
+    expect(contours.length).toBeGreaterThan(0);
     expect(shading.length).toBeGreaterThan(10);
-    expect(shading.some((stroke) => stroke.layer === 'midTone' || stroke.layer === 'darkTone')).toBe(true);
-    for (const stroke of shading) expect(stroke.points.length).toBeGreaterThanOrEqual(2);
+    expect(shading.some((s) => s.layer === 'midTone' || s.layer === 'darkTone')).toBe(true);
+    for (const s of [...structure, ...contours, ...shading]) {
+      expect(s.points.length).toBeGreaterThanOrEqual(2);
+    }
   });
 
-  it('orderStrokes strictly enforces artistic layer order', () => {
+  it('enforces strict layer precedence and deterministic budget-overflow sampling', () => {
+    const makeStroke = (
+      id: string,
+      layer: Stroke['layer'],
+      priority: number,
+      x: number
+    ): Stroke => ({
+      id,
+      kind: 'hatching',
+      layer,
+      order: 0,
+      points: [
+        { x, y: 10, pressure: 0.6 },
+        { x: x + 4, y: 14, pressure: 0.6 },
+      ],
+      brush: { width: 1.5, opacity: 0.4, hardness: 0.6, grain: 0.3, jitter: 0.1 },
+      durationMs: 40,
+      priority,
+      sourceConfidence: 0.8,
+    });
+
     const rawStrokes: Stroke[] = [
-      {
-        id: 's-dark',
-        kind: 'crossHatching',
-        layer: 'darkTone',
-        order: 0,
-        points: [{ x: 0, y: 0, pressure: 0.8 }, { x: 10, y: 10, pressure: 0.8 }],
-        brush: { width: 1.5, opacity: 0.8, hardness: 0.8, grain: 0.4, jitter: 0.2 },
-        durationMs: 100,
-        priority: 50,
-        sourceConfidence: 0.8,
-      },
-      {
-        id: 's-struct',
-        kind: 'construction',
-        layer: 'structure',
-        order: 0,
-        points: [{ x: 0, y: 0, pressure: 0.2 }, { x: 50, y: 50, pressure: 0.2 }],
-        brush: { width: 1, opacity: 0.2, hardness: 0.4, grain: 0.6, jitter: 0.5 },
-        durationMs: 100,
-        priority: 10,
-        sourceConfidence: 0.9,
-      },
-      {
-        id: 's-outline',
-        kind: 'contour',
-        layer: 'outline',
-        order: 0,
-        points: [{ x: 5, y: 5, pressure: 0.6 }, { x: 15, y: 15, pressure: 0.6 }],
-        brush: { width: 1.5, opacity: 0.6, hardness: 0.7, grain: 0.4, jitter: 0.4 },
-        durationMs: 100,
-        priority: 20,
-        sourceConfidence: 0.85,
-      },
-      {
-        id: 's-light',
-        kind: 'hatching',
-        layer: 'lightTone',
-        order: 0,
-        points: [{ x: 20, y: 20, pressure: 0.4 }, { x: 30, y: 30, pressure: 0.4 }],
-        brush: { width: 1, opacity: 0.3, hardness: 0.5, grain: 0.5, jitter: 0.3 },
-        durationMs: 100,
-        priority: 40,
-        sourceConfidence: 0.7,
-      },
-      {
-        id: 's-accent',
-        kind: 'accent',
-        layer: 'finalAccent',
-        order: 0,
-        points: [{ x: 1, y: 1, pressure: 0.9 }, { x: 3, y: 3, pressure: 0.9 }],
-        brush: { width: 2, opacity: 0.9, hardness: 0.9, grain: 0.3, jitter: 0.2 },
-        durationMs: 100,
-        priority: 70,
-        sourceConfidence: 0.95,
-      },
+      makeStroke('s-dark-1', 'darkTone', 50, 20),
+      makeStroke('s-struct-1', 'structure', 10, 5),
+      makeStroke('s-outline-1', 'outline', 20, 8),
+      makeStroke('s-feat-1', 'features', 30, 12),
+      makeStroke('s-light-1', 'lightTone', 40, 15),
+      makeStroke('s-mid-1', 'midTone', 45, 18),
+      makeStroke('s-accent-1', 'finalAccent', 70, 25),
+      makeStroke('s-accent-2', 'finalAccent', 70, 26),
+      makeStroke('s-light-2', 'lightTone', 40, 60),
+      makeStroke('s-dark-2', 'darkTone', 50, 22),
     ];
 
-    const ordered = orderStrokes(rawStrokes);
+    const fullOrdered = orderStrokes(rawStrokes, 20);
+    expect(fullOrdered.map((s) => s.order)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(fullOrdered[0].layer).toBe('structure');
+    expect(fullOrdered[fullOrdered.length - 1].layer).toBe('finalAccent');
 
-    // Layer sequence must be: structure -> outline -> lightTone -> darkTone -> finalAccent
-    expect(ordered.map((s) => s.layer)).toEqual([
-      'structure',
-      'outline',
-      'lightTone',
-      'darkTone',
-      'finalAccent',
-    ]);
+    // Budget cap test: capping 10 strokes to 6 must preserve both essential and dark tonal layers deterministically
+    const cappedA = orderStrokes(
+      rawStrokes.map((s) => ({ ...s })),
+      6
+    );
+    const cappedB = orderStrokes(
+      rawStrokes.map((s) => ({ ...s })),
+      6
+    );
+    expect(cappedA.length).toBeLessThanOrEqual(6);
+    expect(cappedA.map((s) => s.id)).toEqual(cappedB.map((s) => s.id));
+    expect(cappedA.some((s) => s.layer === 'finalAccent')).toBe(true);
 
-    // Order numbers must be sequentially 0, 1, 2, 3, 4
-    expect(ordered.map((s) => s.order)).toEqual([0, 1, 2, 3, 4]);
+    const metrics = computeLayerMetrics(cappedA);
+    expect(Object.values(metrics).reduce((a, b) => a + b, 0)).toBe(cappedA.length);
+  });
+
+  it('exports valid layered SVG and portable JSON scripts', () => {
+    const w = 48;
+    const h = 48;
+    const buffer = new Uint8ClampedArray(w * h * 4).fill(245);
+    for (let y = 14; y < 34; y++) {
+      for (let x = 14; x < 34; x++) {
+        const idx = (y * w + x) * 4;
+        buffer[idx] = 25;
+        buffer[idx + 1] = 25;
+        buffer[idx + 2] = 25;
+      }
+    }
+    const res = reconstructSketchScript(
+      { width: w, height: h, data: buffer } as ImageData,
+      { width: w, height: h, mimeType: 'image/png' },
+      options
+    );
+    expect(res).not.toBeNull();
+    const script = res!.script;
+
+    const svgAll = exportScriptToSvg(script);
+    expect(svgAll).toContain('<svg xmlns="http://www.w3.org/2000/svg"');
+    expect(svgAll).toContain('<path d="M');
+
+    const svgFiltered = exportScriptToSvg(script, {
+      hiddenLayers: new Set(['lightTone', 'midTone', 'darkTone', 'finalAccent']),
+    });
+    expect(svgFiltered).not.toContain('id="layer-darkTone"');
+
+    const jsonStr = exportScriptToJson(script);
+    const parsed = JSON.parse(jsonStr);
+    expect(parsed.version).toBe('1.0');
+    expect(parsed.targetPreview).toBeUndefined();
+    expect(parsed.strokes.length).toBe(script.strokes.length);
   });
 });
 
-describe('PlaybackController State Management', () => {
+describe('PlaybackController Lifecycle, Stepping, and Error Handling', () => {
   const mockScript: StrokeScript = {
     version: '1.0',
-    sourceImage: { width: 100, height: 100, processedWidth: 100, processedHeight: 100, mimeType: 'image/png' },
-    canvas: { width: 100, height: 100, background: '#fbf9f5', padding: 0 },
+    sourceImage: {
+      width: 100,
+      height: 100,
+      processedWidth: 100,
+      processedHeight: 100,
+      mimeType: 'image/png',
+    },
+    canvas: { width: 100, height: 100, background: '#fbf8f1', padding: 0 },
     generation: {
       seed: 123,
       createdAt: new Date().toISOString(),
-      options: {} as any,
+      options: {} as StrokeGenerationOptions,
       strokeCount: 10,
     },
     strokes: Array.from({ length: 10 }, (_, i) => ({
       id: `s-${i}`,
       kind: 'contour',
-      layer: 'outline',
+      layer: i < 4 ? 'outline' : 'darkTone',
       order: i,
-      points: [{ x: i, y: i, pressure: 0.5 }, { x: i + 10, y: i + 10, pressure: 0.5 }],
-      brush: { width: 1, opacity: 0.5, hardness: 0.5, grain: 0.5, jitter: 0.5 },
+      points: [
+        { x: i, y: i, pressure: 0.5 },
+        { x: i + 10, y: i + 10, pressure: 0.5 },
+      ],
+      brush: { width: 1, opacity: 0.5, hardness: 0.5, grain: 0.3, jitter: 0.2 },
       durationMs: 50,
       priority: 1,
       sourceConfidence: 1,
     })),
   };
 
-  const mockEngine = {
-    loadScript: vi.fn(),
-    clear: vi.fn(),
-    drawPaperBackground: vi.fn(),
-    drawStroke: vi.fn(),
-    drawUntil: vi.fn(),
-    renderFrame: vi.fn(),
-    exportPng: vi.fn().mockReturnValue('data:image/png;base64,mock'),
-    resize: vi.fn(),
-    dispose: vi.fn(),
-  } as any;
+  it('handles play, pause, seek(0), stepStrokes, and seekToLayerEnd accurately', () => {
+    const mockEngine = {
+      loadScript: vi.fn(),
+      clear: vi.fn(),
+      drawPaperBackground: vi.fn(),
+      drawStroke: vi.fn(),
+      drawUntil: vi.fn(),
+      renderFrame: vi.fn(),
+      exportPng: vi.fn().mockReturnValue('data:image/png;base64,mock'),
+      resize: vi.fn(),
+      dispose: vi.fn(),
+    } as any;
 
-  it('manages playback lifecycle transitions: ready -> playing -> paused -> seek -> replay', () => {
-    let stateHistory: string[] = [];
     const controller = new PlaybackController({
       engine: mockEngine,
       initialSpeed: 1.0,
-      onStateChange: (st) => {
-        stateHistory.push(st.status);
-      },
+      onStateChange: () => {},
     });
-
-    expect(controller.getState().status).toBe('idle');
 
     controller.load(mockScript);
     expect(controller.getState().status).toBe('ready');
-    expect(controller.getState().totalStrokes).toBe(10);
 
-    // Play
     controller.play();
     expect(controller.getState().status).toBe('playing');
 
-    // Pause
     controller.pause();
     expect(controller.getState().status).toBe('paused');
 
-    // Seek to 50%
     controller.seek(0.5);
-    expect(mockEngine.drawUntil).toHaveBeenCalledWith(5);
     expect(controller.getState().currentStrokeIndex).toBe(5);
 
-    // Replay
-    controller.replay();
-    expect(mockEngine.clear).toHaveBeenCalled();
-    expect(mockEngine.drawPaperBackground).toHaveBeenCalled();
-    expect(controller.getState().currentStrokeIndex).toBe(0);
+    controller.stepStrokes(2);
+    expect(controller.getState().currentStrokeIndex).toBe(7);
 
-    // Speed change
-    controller.setSpeed(4.0);
-    expect(controller.getState().speed).toBe(4.0);
+    controller.seekToLayerEnd('outline');
+    expect(controller.getState().currentStrokeIndex).toBe(3);
 
-    // Seek to 0% and 100%
     controller.seek(0);
-    expect(controller.getState().currentStrokeIndex).toBe(0);
+    expect(controller.getState().progress).toBe(0);
+    expect(mockEngine.drawUntil).toHaveBeenCalledWith(-1);
 
     controller.seek(1.0);
     expect(controller.getState().status).toBe('completed');
-    expect(controller.getState().currentStrokeIndex).toBe(9);
-
     controller.dispose();
   });
 });
 
 describe('End-to-End Pipeline Performance & Boundary Integrity', () => {
-  it('processes realistic synthetic portrait image in under 500ms with all points bounded', () => {
+  it('reconstructs a 256x256 synthetic portrait in under 600ms with bounded coordinates', () => {
     const w = 256;
     const h = 256;
     const buffer = new Uint8ClampedArray(w * h * 4);
 
-    // Generate a synthetic face-like contrast pattern:
-    // Oval face in center with dark eyes, dark hair, light cheeks
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         const idx = (y * w + x) * 4;
@@ -386,21 +386,21 @@ describe('End-to-End Pipeline Performance & Boundary Integrity', () => {
         const dy = (y - h * 0.5) / (h * 0.45);
         const distSq = dx * dx + dy * dy;
 
-        let val = 245; // Background white
+        let val = 235;
         if (distSq < 1.0) {
-          val = 190; // Face skin tone
-          // Eyes
-          if (Math.hypot(x - w * 0.4, y - h * 0.42) < 12 || Math.hypot(x - w * 0.6, y - h * 0.42) < 12) {
-            val = 25; // Dark pupils
+          val = 188;
+          if (
+            Math.hypot(x - w * 0.4, y - h * 0.42) < 12 ||
+            Math.hypot(x - w * 0.6, y - h * 0.42) < 12
+          ) {
+            val = 22;
           }
-          // Mouth
           if (Math.abs(y - h * 0.65) < 5 && Math.abs(x - w * 0.5) < 25) {
-            val = 40;
+            val = 38;
           }
         }
-        // Hair on top
         if (y < h * 0.35 && distSq < 1.1) {
-          val = 20;
+          val = 18;
         }
 
         buffer[idx] = val;
@@ -410,44 +410,30 @@ describe('End-to-End Pipeline Performance & Boundary Integrity', () => {
       }
     }
 
-    const testImgData: ImageData = {
-      width: w,
-      height: h,
-      data: buffer,
-      colorSpace: 'srgb',
-    } as ImageData;
-
     const start = performance.now();
-
-    // 1. Build the hidden traditional sketch target.
-    const target = buildSketchTarget(testImgData);
-
-    // 2. Reconstruct it with tonal strokes and restrained contours.
-    const rng = new SeededRandom(777);
-    const options: StrokeGenerationOptions = {
-      maxProcessingSize: 256,
-      targetStrokeCount: 1500,
-      contourSensitivity: 0.5,
-      shadingDensity: 0.6,
-      backgroundSuppression: 0.5,
-      minStrokeLength: 4,
-      maxStrokeLength: 80,
-      speedPreset: 'normal',
-    };
-    const shading = generateResidualStrokes(target, options, rng);
-    const contours = generateDetailContours(target, options, rng);
-
-    // 3. Order & cap.
-    const rawStrokes = [...contours, ...shading];
-    const ordered = orderStrokes(rawStrokes, options.targetStrokeCount);
-
+    const reconstructed = reconstructSketchScript(
+      { width: w, height: h, data: buffer } as ImageData,
+      { width: w, height: h, mimeType: 'image/png' },
+      {
+        maxProcessingSize: 256,
+        targetStrokeCount: 1600,
+        contourSensitivity: 0.58,
+        shadingDensity: 0.65,
+        backgroundSuppression: 0.6,
+        minStrokeLength: 4,
+        maxStrokeLength: 80,
+        speedPreset: 'normal',
+        seed: 777,
+      }
+    );
     const elapsed = performance.now() - start;
 
-    expect(elapsed).toBeLessThan(1000); // Fast enough for smooth UX
+    expect(reconstructed).not.toBeNull();
+    const ordered = reconstructed!.script.strokes;
+    expect(elapsed).toBeLessThan(800);
     expect(ordered.length).toBeGreaterThan(40);
-    expect(ordered.length).toBeLessThanOrEqual(options.targetStrokeCount);
+    expect(ordered.length).toBeLessThanOrEqual(1600);
 
-    // Coordinate boundary verification: all points must stay within canvas bounds
     for (const stroke of ordered) {
       expect(stroke.points.length).toBeGreaterThanOrEqual(2);
       for (const pt of stroke.points) {

@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { loadImageFromFile } from '../lib/image/loadImage';
+import { resizeImageToProcessingSize } from '../lib/image/resizeImage';
 import type {
   StrokeGenerationOptions,
   StrokeWorkerRequest,
   StrokeWorkerResponse,
+  UploadImageMeta,
 } from '../types/image-processing';
 import type { StrokeScript } from '../types/stroke';
-import { loadImageFromFile } from '../lib/image/loadImage';
-import { resizeImageToProcessingSize } from '../lib/image/resizeImage';
 
 export interface StrokeGenerationState {
   status: 'idle' | 'loading' | 'generating' | 'ready' | 'error';
@@ -19,25 +20,34 @@ export interface StrokeGenerationState {
 
 export const DEFAULT_OPTIONS: StrokeGenerationOptions = {
   maxProcessingSize: 768,
-  // Similarity is the priority: broad strokes establish mass, then shorter
-  // residual strokes preserve eyes, mouth, hair and clothing folds.
-  targetStrokeCount: 9000,
-  contourSensitivity: 0.5,
-  shadingDensity: 0.6,
-  backgroundSuppression: 0.5,
+  targetStrokeCount: 9500,
+  contourSensitivity: 0.58,
+  shadingDensity: 0.65,
+  backgroundSuppression: 0.6,
   minStrokeLength: 4,
   maxStrokeLength: 120,
   speedPreset: 'normal',
+  stylePreset: 'classic',
+  paperGrain: 0.32,
 };
+
+interface CachedSource {
+  image: HTMLImageElement;
+  meta: UploadImageMeta;
+  objectUrl: string;
+}
 
 export function useStrokeGeneration() {
   const [state, setState] = useState<StrokeGenerationState>({
     status: 'idle',
     progress: 0,
   });
+  const [sourcePreviewUrl, setSourcePreviewUrl] = useState<string | null>(null);
+  const [sourceMeta, setSourceMeta] = useState<UploadImageMeta | null>(null);
 
   const workerRef = useRef<Worker | null>(null);
   const activeRequestIdRef = useRef<string | null>(null);
+  const cachedSourceRef = useRef<CachedSource | null>(null);
 
   const terminateWorker = useCallback(() => {
     if (workerRef.current) {
@@ -47,11 +57,19 @@ export function useStrokeGeneration() {
     activeRequestIdRef.current = null;
   }, []);
 
+  const revokeSourceUrl = useCallback(() => {
+    if (cachedSourceRef.current?.objectUrl) {
+      URL.revokeObjectURL(cachedSourceRef.current.objectUrl);
+      cachedSourceRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     return () => {
       terminateWorker();
+      revokeSourceUrl();
     };
-  }, [terminateWorker]);
+  }, [terminateWorker, revokeSourceUrl]);
 
   const cancel = useCallback(() => {
     if (activeRequestIdRef.current && workerRef.current) {
@@ -64,10 +82,10 @@ export function useStrokeGeneration() {
     terminateWorker();
     setState((prev) => ({
       ...prev,
-      status: 'idle',
-      progress: 0,
+      status: prev.script ? 'ready' : 'idle',
+      progress: prev.script ? 1 : 0,
       phase: undefined,
-      message: '生成已取消',
+      message: '已取消当前生成任务',
     }));
   }, [terminateWorker]);
 
@@ -79,101 +97,129 @@ export function useStrokeGeneration() {
     });
   }, [terminateWorker]);
 
+  const dispatchToWorker = useCallback(
+    async (
+      image: HTMLImageElement,
+      meta: UploadImageMeta,
+      options: StrokeGenerationOptions
+    ): Promise<StrokeScript> => {
+      terminateWorker();
+
+      setState((prev) => ({
+        ...prev,
+        status: 'loading',
+        progress: 0.1,
+        phase: 'resizing',
+        message: '正在标准化画幅与采样网格...',
+        error: undefined,
+      }));
+
+      const { imageData } = resizeImageToProcessingSize(image, options.maxProcessingSize);
+
+      const requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      activeRequestIdRef.current = requestId;
+
+      const worker = new Worker(
+        new URL('../workers/strokeGenerator.worker.ts', import.meta.url),
+        { type: 'module' }
+      );
+      workerRef.current = worker;
+
+      setState((prev) => ({
+        ...prev,
+        status: 'generating',
+        progress: 0.14,
+        phase: 'preprocessing',
+        message: '正在启动素描笔触重建引擎...',
+      }));
+
+      return await new Promise<StrokeScript>((resolve, reject) => {
+        worker.onmessage = (e: MessageEvent<StrokeWorkerResponse>) => {
+          const resp = e.data;
+          if (resp.requestId !== requestId) return;
+
+          if (resp.type === 'progress') {
+            setState((prev) => ({
+              ...prev,
+              status: 'generating',
+              progress: resp.progress,
+              phase: resp.phase,
+              message: resp.message,
+            }));
+          } else if (resp.type === 'complete') {
+            terminateWorker();
+            setState({
+              status: 'ready',
+              progress: 1.0,
+              phase: 'completed',
+              message: `已生成 ${resp.script.strokes.length} 条分层笔触`,
+              script: resp.script,
+            });
+            resolve(resp.script);
+          } else if (resp.type === 'error') {
+            terminateWorker();
+            setState({
+              status: 'error',
+              progress: 0,
+              error: resp.error.message,
+            });
+            reject(new Error(resp.error.message));
+          }
+        };
+
+        worker.onerror = (err) => {
+          terminateWorker();
+          const msg = err.message || '后台笔触计算线程异常中断';
+          setState({
+            status: 'error',
+            progress: 0,
+            error: msg,
+          });
+          reject(new Error(msg));
+        };
+
+        const req: StrokeWorkerRequest = {
+          type: 'generate',
+          requestId,
+          imageData,
+          meta,
+          options,
+        };
+        // Zero-copy transfer of the underlying ArrayBuffer to the worker thread
+        worker.postMessage(req, [imageData.data.buffer]);
+      });
+    },
+    [terminateWorker]
+  );
+
   const generateFromFile = useCallback(
-    async (file: File, customOptions?: Partial<StrokeGenerationOptions>): Promise<StrokeScript> => {
+    async (
+      file: File,
+      customOptions?: Partial<StrokeGenerationOptions>
+    ): Promise<StrokeScript> => {
       terminateWorker();
 
       setState({
         status: 'loading',
         progress: 0.05,
         phase: 'loading',
-        message: '正在读取并解析图片...',
+        message: '正在解码原图...',
       });
 
-      const options: StrokeGenerationOptions = {
+      const mergedOptions: StrokeGenerationOptions = {
         ...DEFAULT_OPTIONS,
         ...customOptions,
       };
 
       try {
         const { meta, image } = await loadImageFromFile(file);
+        revokeSourceUrl();
+        const previewUrl = URL.createObjectURL(file);
+        cachedSourceRef.current = { image, meta, objectUrl: previewUrl };
+        setSourcePreviewUrl(previewUrl);
+        setSourceMeta(meta);
 
-        setState({
-          status: 'loading',
-          progress: 0.1,
-          phase: 'resizing',
-          message: '正在标准化图片尺寸...',
-        });
-
-        const { imageData } = resizeImageToProcessingSize(image, options.maxProcessingSize);
-
-        const requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-        activeRequestIdRef.current = requestId;
-
-        // Initialize Web Worker
-        const worker = new Worker(
-          new URL('../workers/strokeGenerator.worker.ts', import.meta.url),
-          { type: 'module' }
-        );
-        workerRef.current = worker;
-
-        setState({
-          status: 'generating',
-          progress: 0.15,
-          phase: 'preprocessing',
-          message: '正在启动传统素描重建引擎...',
-        });
-
-        return await new Promise<StrokeScript>((resolve, reject) => {
-          worker.onmessage = (e: MessageEvent<StrokeWorkerResponse>) => {
-            const resp = e.data;
-            if (resp.requestId !== requestId) return;
-
-            if (resp.type === 'progress') {
-              setState({
-                status: 'generating',
-                progress: resp.progress,
-                phase: resp.phase,
-                message: resp.message,
-              });
-            } else if (resp.type === 'complete') {
-              setState({
-                status: 'ready',
-                progress: 1.0,
-                phase: 'completed',
-                message: `成功生成 ${resp.script.strokes.length} 条素描笔触`,
-                script: resp.script,
-              });
-              resolve(resp.script);
-            } else if (resp.type === 'error') {
-              setState({
-                status: 'error',
-                progress: 0,
-                error: resp.error.message,
-              });
-              reject(new Error(resp.error.message));
-            }
-          };
-
-          worker.onerror = (err) => {
-            const msg = err.message || 'Worker 运行时未知错误';
-            setState({
-              status: 'error',
-              progress: 0,
-              error: msg,
-            });
-            reject(new Error(msg));
-          };
-
-          const req: StrokeWorkerRequest = {
-            type: 'generate',
-            requestId,
-            imageData,
-            meta,
-            options,
-          };
-          worker.postMessage(req);
-        });
+        return await dispatchToWorker(image, meta, mergedOptions);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         setState({
@@ -184,12 +230,39 @@ export function useStrokeGeneration() {
         throw err;
       }
     },
-    [terminateWorker]
+    [terminateWorker, revokeSourceUrl, dispatchToWorker]
+  );
+
+  const regenerateWithOptions = useCallback(
+    async (customOptions: Partial<StrokeGenerationOptions>): Promise<StrokeScript | null> => {
+      const cached = cachedSourceRef.current;
+      if (!cached) return null;
+      const mergedOptions: StrokeGenerationOptions = {
+        ...DEFAULT_OPTIONS,
+        ...customOptions,
+      };
+      try {
+        return await dispatchToWorker(cached.image, cached.meta, mergedOptions);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setState({
+          status: 'error',
+          progress: 0,
+          error: msg,
+        });
+        throw err;
+      }
+    },
+    [dispatchToWorker]
   );
 
   return {
     state,
+    sourcePreviewUrl,
+    sourceMeta,
+    hasLoadedSource: !!sourceMeta,
     generateFromFile,
+    regenerateWithOptions,
     cancel,
     reset,
   };

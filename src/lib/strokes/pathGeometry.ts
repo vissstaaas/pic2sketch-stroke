@@ -1,88 +1,107 @@
 import type { StrokePoint } from '../../types/stroke';
+import { catmullRom, clamp, distance, pointToSegmentDistance } from '../../utils/math';
 
-/** Ramer-Douglas-Peucker simplification. */
+/** Ramer-Douglas-Peucker polyline simplification. */
 export function simplifyPoints(points: StrokePoint[], epsilon: number): StrokePoint[] {
-  if (points.length < 3) return points;
-  const sqEpsilon = epsilon * epsilon;
-
-  const pointLineDistanceSq = (p: StrokePoint, p1: StrokePoint, p2: StrokePoint) => {
-    let x = p1.x;
-    let y = p1.y;
-    let dx = p2.x - x;
-    let dy = p2.y - y;
-    if (dx !== 0 || dy !== 0) {
-      const t = ((p.x - x) * dx + (p.y - y) * dy) / (dx * dx + dy * dy);
-      if (t > 1) { x = p2.x; y = p2.y; } else if (t > 0) { x += dx * t; y += dy * t; }
-    }
-    dx = p.x - x;
-    dy = p.y - y;
-    return dx * dx + dy * dy;
-  };
+  if (points.length < 3) return points.slice();
 
   const step = (first: number, last: number, tolerance: number, out: StrokePoint[]) => {
-    let maxSqDist = tolerance;
-    let index = -1;
+    let maxDist = tolerance;
+    let splitIndex = -1;
+    const pFirst = points[first];
+    const pLast = points[last];
+
     for (let i = first + 1; i < last; i++) {
-      const sqDist = pointLineDistanceSq(points[i], points[first], points[last]);
-      if (sqDist > maxSqDist) { index = i; maxSqDist = sqDist; }
+      const d = pointToSegmentDistance(
+        points[i].x,
+        points[i].y,
+        pFirst.x,
+        pFirst.y,
+        pLast.x,
+        pLast.y
+      );
+      if (d > maxDist) {
+        splitIndex = i;
+        maxDist = d;
+      }
     }
-    if (maxSqDist > tolerance && index > -1) {
-      if (index - first > 1) step(first, index, tolerance, out);
-      out.push(points[index]);
-      if (last - index > 1) step(index, last, tolerance, out);
+
+    if (splitIndex > -1) {
+      if (splitIndex - first > 1) step(first, splitIndex, tolerance, out);
+      out.push(points[splitIndex]);
+      if (last - splitIndex > 1) step(splitIndex, last, tolerance, out);
     }
   };
 
   const simplified: StrokePoint[] = [points[0]];
-  step(0, points.length - 1, sqEpsilon, simplified);
+  step(0, points.length - 1, epsilon, simplified);
   simplified.push(points[points.length - 1]);
   return simplified;
 }
 
-/** Catmull-Rom resample so rendered strokes are smooth rather than polygonal. */
+/** Smooth Catmull-Rom spline resampling with preserved endpoint pressures. */
 export function resamplePoints(points: StrokePoint[], spacing: number): StrokePoint[] {
-  if (points.length < 2) return points;
+  if (points.length < 2) return points.slice();
+  const safeSpacing = Math.max(0.6, spacing);
   const result: StrokePoint[] = [];
+
   for (let i = 0; i < points.length - 1; i++) {
     const p0 = points[Math.max(0, i - 1)];
     const p1 = points[i];
     const p2 = points[i + 1];
     const p3 = points[Math.min(points.length - 1, i + 2)];
-    const segLen = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-    const steps = Math.max(1, Math.min(24, Math.round(segLen / spacing)));
+    const segLen = distance(p1.x, p1.y, p2.x, p2.y);
+    const steps = clamp(Math.round(segLen / safeSpacing), 1, 28);
+
     for (let s = 0; s < steps; s++) {
       const t = s / steps;
-      const t2 = t * t;
-      const t3 = t2 * t;
-      const x = 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3);
-      const y = 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
-      const pressure = 0.5 * ((2 * p1.pressure) + (-p0.pressure + p2.pressure) * t + (2 * p0.pressure - 5 * p1.pressure + 4 * p2.pressure - p3.pressure) * t2 + (-p0.pressure + 3 * p1.pressure - 3 * p2.pressure + p3.pressure) * t3);
       result.push({
-        x: Math.round(x * 10) / 10,
-        y: Math.round(y * 10) / 10,
-        pressure: Math.max(0.15, Math.min(1, pressure)),
+        x: Math.round(catmullRom(p0.x, p1.x, p2.x, p3.x, t) * 10) / 10,
+        y: Math.round(catmullRom(p0.y, p1.y, p2.y, p3.y, t) * 10) / 10,
+        pressure: clamp(catmullRom(p0.pressure, p1.pressure, p2.pressure, p3.pressure, t), 0.14, 1),
       });
     }
   }
-  result.push(points[points.length - 1]);
+  const last = points[points.length - 1];
+  result.push({
+    x: Math.round(last.x * 10) / 10,
+    y: Math.round(last.y * 10) / 10,
+    pressure: clamp(last.pressure, 0.14, 1),
+  });
   return result;
 }
 
 export function pathLength(points: StrokePoint[]): number {
   let length = 0;
   for (let i = 1; i < points.length; i++) {
-    length += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+    length += distance(points[i].x, points[i - 1].x, points[i].y, points[i - 1].y);
   }
   return length;
 }
 
-/** Taper pressure at both ends so strokes start and lift off the paper. */
+/** Measures mean absolute turning angle (radians) to identify intricate facial/detail features. */
+export function meanCurvature(points: StrokePoint[]): number {
+  if (points.length < 3) return 0;
+  let angleSum = 0;
+  let count = 0;
+  for (let i = 1; i < points.length - 1; i++) {
+    const a1 = Math.atan2(points[i].y - points[i - 1].y, points[i].x - points[i - 1].x);
+    const a2 = Math.atan2(points[i + 1].y - points[i].y, points[i + 1].x - points[i].x);
+    let diff = Math.abs(a2 - a1);
+    if (diff > Math.PI) diff = Math.PI * 2 - diff;
+    angleSum += diff;
+    count++;
+  }
+  return count > 0 ? angleSum / count : 0;
+}
+
 export function taperEnds(points: StrokePoint[], taperCount: number): void {
+  if (points.length < 2) return;
   const count = Math.max(1, Math.min(taperCount, Math.floor(points.length / 3)));
   for (let i = 0; i < points.length; i++) {
     let taper = 1;
-    if (i < count) taper = (i + 1) / count;
-    else if (i > points.length - 1 - count) taper = (points.length - i) / count;
-    points[i].pressure = Math.max(0.15, points[i].pressure * taper);
+    if (i < count) taper = (i + 1) / (count + 0.4);
+    else if (i > points.length - 1 - count) taper = (points.length - i) / (count + 0.4);
+    points[i].pressure = clamp(points[i].pressure * taper, 0.14, 1);
   }
 }
