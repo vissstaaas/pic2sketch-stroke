@@ -8,7 +8,15 @@ export interface UploadImageMeta {
   height: number;
 }
 
-export type SketchStylePreset = 'classic' | 'portrait' | 'lineart' | 'dramatic';
+export type SketchStylePreset =
+  | 'classic'
+  | 'portrait'
+  | 'pet'
+  | 'landscape'
+  | 'architecture'
+  | 'botanical'
+  | 'lineart'
+  | 'dramatic';
 
 export interface StrokeGenerationOptions {
   maxProcessingSize: number;

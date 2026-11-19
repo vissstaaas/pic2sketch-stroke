@@ -24,18 +24,18 @@ const STYLE_PRESETS: PresetDescriptor[] = [
   {
     id: 'classic',
     label: '学院写实',
-    subtitle: '均衡排线 · 三峰色调',
+    subtitle: '通用均衡 · 静物雕塑',
     defaults: {
       stylePreset: 'classic',
       targetStrokeCount: 9500,
       contourSensitivity: 0.58,
-      shadingDensity: 0.65,
-      backgroundSuppression: 0.6,
+      shadingDensity: 0.66,
+      backgroundSuppression: 0.52,
     },
   },
   {
     id: 'portrait',
-    label: '细腻肖像',
+    label: '细腻人像',
     subtitle: '清透肤质 · 顺滑发丝',
     defaults: {
       stylePreset: 'portrait',
@@ -46,27 +46,75 @@ const STYLE_PRESETS: PresetDescriptor[] = [
     },
   },
   {
+    id: 'pet',
+    label: '萌宠毛发',
+    subtitle: '蓬松毛流 · 亮眼胡须',
+    defaults: {
+      stylePreset: 'pet',
+      targetStrokeCount: 11000,
+      contourSensitivity: 0.6,
+      shadingDensity: 0.68,
+      backgroundSuppression: 0.64,
+    },
+  },
+  {
+    id: 'landscape',
+    label: '山水风景',
+    subtitle: '云雾留调 · 空气透视',
+    defaults: {
+      stylePreset: 'landscape',
+      targetStrokeCount: 10800,
+      contourSensitivity: 0.5,
+      shadingDensity: 0.7,
+      backgroundSuppression: 0.1,
+    },
+  },
+  {
+    id: 'architecture',
+    label: '建筑透视',
+    subtitle: '锐利直构 · 街景载具',
+    defaults: {
+      stylePreset: 'architecture',
+      targetStrokeCount: 12000,
+      contourSensitivity: 0.68,
+      shadingDensity: 0.72,
+      backgroundSuppression: 0.48,
+    },
+  },
+  {
+    id: 'botanical',
+    label: '花卉美食',
+    subtitle: '柔雅花瓣 · 细腻质感',
+    defaults: {
+      stylePreset: 'botanical',
+      targetStrokeCount: 10500,
+      contourSensitivity: 0.6,
+      shadingDensity: 0.66,
+      backgroundSuppression: 0.65,
+    },
+  },
+  {
     id: 'lineart',
     label: '纯净速写',
-    subtitle: 'FDoG 线稿 · 极简明暗',
+    subtitle: '动漫插画 · 极简线稿',
     defaults: {
       stylePreset: 'lineart',
-      targetStrokeCount: 4200,
+      targetStrokeCount: 4600,
       contourSensitivity: 0.68,
       shadingDensity: 0.34,
-      backgroundSuppression: 0.78,
+      backgroundSuppression: 0.76,
     },
   },
   {
     id: 'dramatic',
-    label: '强烈明暗',
-    subtitle: '4B/6B 炭精 · 浓郁体积',
+    label: '强烈炭笔',
+    subtitle: '浓郁体积 · 夜景高反差',
     defaults: {
       stylePreset: 'dramatic',
       targetStrokeCount: 12000,
       contourSensitivity: 0.6,
       shadingDensity: 0.82,
-      backgroundSuppression: 0.55,
+      backgroundSuppression: 0.45,
     },
   },
 ];
@@ -90,7 +138,7 @@ export const ParameterPanel: React.FC<ParameterPanelProps> = ({
       <div className="param-section">
         <div className="param-section-label">
           <SlidersHorizontal size={13} />
-          <span>艺术风格预设</span>
+          <span>题材与风格预设</span>
         </div>
         <div className="preset-grid">
           {STYLE_PRESETS.map((preset) => (

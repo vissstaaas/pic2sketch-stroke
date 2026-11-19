@@ -1,20 +1,29 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { Columns2, Eye, Pencil, ScanSearch } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Bot, Columns2, Eye, Pencil, ScanSearch } from 'lucide-react';
 import { GenerationStatus } from '../components/GenerationStatus';
-import { ImageUploader } from '../components/ImageUploader';
+import { DEMO_SAMPLE_URL, ImageUploader } from '../components/ImageUploader';
 import { LayerInspector } from '../components/LayerInspector';
 import { ParameterPanel } from '../components/ParameterPanel';
 import { PlaybackControls } from '../components/PlaybackControls';
+import { PlotterCodeModal, PlotterPanel } from '../components/PlotterPanel';
+import { PlotterStage } from '../components/PlotterStage';
 import { SketchCanvas } from '../components/SketchCanvas';
 import { TargetSketchPreview } from '../components/TargetSketchPreview';
 import { useSketchPlayback } from '../hooks/useSketchPlayback';
 import { DEFAULT_OPTIONS, useStrokeGeneration } from '../hooks/useStrokeGeneration';
 import type { SketchCanvasEngine } from '../lib/canvas/SketchCanvasEngine';
 import { exportScriptToJson, exportScriptToSvg } from '../lib/export/exportSketch';
+import {
+  buildPlotterPlan,
+  DEFAULT_PLOTTER_CONFIG,
+  exportPlotterCenterlineSvg,
+  exportPlotterGcode,
+  type PlotterConfig,
+} from '../lib/plotter/buildPlotterPlan';
 import type { StrokeGenerationOptions } from '../types/image-processing';
 import type { StrokeLayer } from '../types/stroke';
 
-type CanvasViewMode = 'drawing' | 'compare' | 'target' | 'source';
+type CanvasViewMode = 'drawing' | 'compare' | 'target' | 'source' | 'plotter';
 
 export const SketchMvpPage: React.FC = () => {
   const [engine, setEngine] = useState<SketchCanvasEngine | null>(null);
@@ -24,6 +33,8 @@ export const SketchMvpPage: React.FC = () => {
   const [seedLocked, setSeedLocked] = useState(false);
   const [hiddenLayers, setHiddenLayers] = useState<Set<StrokeLayer>>(new Set());
   const [exportFeedback, setExportFeedback] = useState<string | null>(null);
+  const [plotterConfig, setPlotterConfig] = useState<PlotterConfig>(DEFAULT_PLOTTER_CONFIG);
+  const [codePreviewTab, setCodePreviewTab] = useState<'gcode' | 'svg' | null>(null);
 
   const {
     state: genState,
@@ -100,6 +111,32 @@ export const SketchMvpPage: React.FC = () => {
     },
     [effectiveOptionsForRun, engine, generateFromFile, options, reset]
   );
+
+  const handleFileSelectRef = useRef(handleFileSelect);
+  handleFileSelectRef.current = handleFileSelect;
+  const didAutoLoadRef = useRef(false);
+
+  // Auto-load built-in sample portrait on first visit so canvas, Plotter Tab & Panel are immediately ready
+  useEffect(() => {
+    if (didAutoLoadRef.current) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(DEMO_SAMPLE_URL);
+        if (!res.ok || cancelled) return;
+        const blob = await res.blob();
+        if (cancelled) return;
+        didAutoLoadRef.current = true;
+        const file = new File([blob], 'studio-portrait-sample.png', { type: 'image/png' });
+        await handleFileSelectRef.current(file);
+      } catch {
+        // Ignore silent preload failures so manual upload still works cleanly
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleRegenerate = useCallback(async () => {
     if (!hasLoadedSource) return;
@@ -244,6 +281,50 @@ export const SketchMvpPage: React.FC = () => {
     }
   }, [genState.script, showNotice]);
 
+  const plotterPlan = useMemo(() => {
+    if (!genState.script) return null;
+    return buildPlotterPlan(genState.script, plotterConfig, hiddenLayers);
+  }, [genState.script, plotterConfig, hiddenLayers]);
+
+  const handleUpdatePlotterConfig = useCallback((partial: Partial<PlotterConfig>) => {
+    setPlotterConfig((prev) => ({ ...prev, ...partial }));
+    setViewMode('plotter');
+  }, []);
+
+  const handleActivatePlotterView = useCallback(() => {
+    setViewMode('plotter');
+  }, []);
+
+  const handleExportPlotterGcode = useCallback(() => {
+    if (!plotterPlan || !genState.script) return;
+    try {
+      const gcode = exportPlotterGcode(plotterPlan);
+      const blob = new Blob([gcode], { type: 'text/plain;charset=utf-8' });
+      triggerBlobDownload(
+        blob,
+        `atelier-plotter-${plotterConfig.paper}-${plotterConfig.tier}-${genState.script.generation.seed}.gcode`
+      );
+      showNotice(`已导出真机 G-code（${plotterPlan.telemetry.penLifts} 次抬笔）`);
+    } catch (err) {
+      showNotice('导出 G-code 失败：' + (err instanceof Error ? err.message : String(err)));
+    }
+  }, [genState.script, plotterConfig.paper, plotterConfig.tier, plotterPlan, showNotice]);
+
+  const handleExportPlotterSvg = useCallback(() => {
+    if (!plotterPlan || !genState.script) return;
+    try {
+      const svg = exportPlotterCenterlineSvg(plotterPlan);
+      const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
+      triggerBlobDownload(
+        blob,
+        `atelier-centerline-${plotterConfig.paper}-${plotterConfig.tier}-${genState.script.generation.seed}.svg`
+      );
+      showNotice('已导出写字机单线中心线 SVG');
+    } catch (err) {
+      showNotice('导出单线 SVG 失败：' + (err instanceof Error ? err.message : String(err)));
+    }
+  }, [genState.script, plotterConfig.paper, plotterConfig.tier, plotterPlan, showNotice]);
+
   const isBusy = genState.status === 'loading' || genState.status === 'generating';
   const isScriptReady = !!genState.script && genState.script.strokes.length > 0;
   const canPlay = isScriptReady && playbackState.status !== 'playing';
@@ -251,6 +332,22 @@ export const SketchMvpPage: React.FC = () => {
   const canResume = playbackState.status === 'paused';
   const canReplay = isScriptReady;
   const canExport = !!engine && isScriptReady;
+
+  const plotterPanelCard = (
+    <div className="sidebar-card">
+      <PlotterPanel
+        config={plotterConfig}
+        plan={plotterPlan}
+        isPlotterViewActive={viewMode === 'plotter'}
+        onChangeConfig={handleUpdatePlotterConfig}
+        onActivatePlotterView={handleActivatePlotterView}
+        onExportGcode={handleExportPlotterGcode}
+        onExportCenterlineSvg={handleExportPlotterSvg}
+        onOpenCodePreview={(tab) => setCodePreviewTab(tab)}
+        disabled={isBusy}
+      />
+    </div>
+  );
 
   return (
     <div className="app-container">
@@ -261,7 +358,7 @@ export const SketchMvpPage: React.FC = () => {
           </div>
           <div className="brand-text">
             <h1>Atelier Graphite</h1>
-            <span className="version-tag">ETF · FDoG · 分级铅笔逐笔重构工坊</span>
+            <span className="version-tag">ETF · FDoG · 分级铅笔逐笔重构与机械臂走刀工坊</span>
           </div>
         </div>
 
@@ -272,7 +369,7 @@ export const SketchMvpPage: React.FC = () => {
             </div>
           )}
           <div className="header-spec-chip">
-            <span>纯笔触矢量重构 · 零蒙版渐显 · Canvas / SVG 双引擎</span>
+            <span>纯笔触矢量重构 · 物理单线中心线 · Z轴压感 G-code</span>
           </div>
         </div>
       </header>
@@ -315,6 +412,17 @@ export const SketchMvpPage: React.FC = () => {
               >
                 <ScanSearch size={14} />
                 <span>算法目标场 (诊断)</span>
+              </button>
+              <button
+                className={`view-mode-button view-mode-plotter ${
+                  viewMode === 'plotter' ? 'active' : ''
+                }`}
+                onClick={() => setViewMode('plotter')}
+                type="button"
+                disabled={!isScriptReady}
+              >
+                <Bot size={14} />
+                <span>真机走刀工坊</span>
               </button>
             </div>
 
@@ -379,9 +487,20 @@ export const SketchMvpPage: React.FC = () => {
                 </section>
               )}
 
+              {viewMode === 'plotter' && plotterPlan && (
+                <section className="comparison-pane plotter-pane">
+                  <PlotterStage
+                    plan={plotterPlan}
+                    onOpenCodePreview={(tab) => setCodePreviewTab(tab)}
+                  />
+                </section>
+              )}
+
               <section
                 className={`comparison-pane drawing-pane ${
-                  viewMode === 'target' || viewMode === 'source' ? 'is-hidden' : ''
+                  viewMode === 'target' || viewMode === 'source' || viewMode === 'plotter'
+                    ? 'is-hidden'
+                    : ''
                 }`}
               >
                 <div className="comparison-label">
@@ -435,6 +554,8 @@ export const SketchMvpPage: React.FC = () => {
             <ImageUploader onFileSelect={handleFileSelect} disabled={isBusy} />
           </div>
 
+          {viewMode === 'plotter' && plotterPanelCard}
+
           <div className="sidebar-card">
             <GenerationStatus state={genState} />
           </div>
@@ -452,6 +573,8 @@ export const SketchMvpPage: React.FC = () => {
             />
           </div>
 
+          {viewMode !== 'plotter' && plotterPanelCard}
+
           <div className="sidebar-card">
             <LayerInspector
               metrics={genState.script?.generation.layerMetrics}
@@ -465,6 +588,16 @@ export const SketchMvpPage: React.FC = () => {
           </div>
         </aside>
       </main>
+
+      {codePreviewTab && plotterPlan && (
+        <PlotterCodeModal
+          plan={plotterPlan}
+          initialTab={codePreviewTab}
+          onClose={() => setCodePreviewTab(null)}
+          onDownloadGcode={handleExportPlotterGcode}
+          onDownloadSvg={handleExportPlotterSvg}
+        />
+      )}
     </div>
   );
 };

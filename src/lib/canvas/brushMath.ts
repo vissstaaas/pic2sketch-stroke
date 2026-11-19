@@ -1,9 +1,9 @@
 import type { BrushStyle, PencilGrade, Stroke, StrokeLayer, StrokePoint } from '../../types/stroke';
-import { clamp01 } from '../../utils/math';
+import { clamp, clamp01 } from '../../utils/math';
 import { SeededRandom } from '../../utils/random';
 
-export const MIN_WIDTH_FACTOR = 0.42;
-const CAP_SEGMENTS = 6;
+export const MIN_WIDTH_FACTOR = 0.32;
+const CAP_SEGMENTS = 5;
 
 interface GraphiteSpec {
   cssColor: string;
@@ -13,11 +13,11 @@ interface GraphiteSpec {
 }
 
 const GRAPHITE_PALETTE: Record<PencilGrade, GraphiteSpec> = {
-  '2H': { cssColor: 'rgba(84, 81, 78, 1)', svgHex: '#54514e', darknessFactor: 0.68 },
-  HB: { cssColor: 'rgba(56, 53, 50, 1)', svgHex: '#383532', darknessFactor: 0.79 },
+  '2H': { cssColor: 'rgba(88, 84, 80, 1)', svgHex: '#585450', darknessFactor: 0.68 },
+  HB: { cssColor: 'rgba(58, 55, 51, 1)', svgHex: '#3a3733', darknessFactor: 0.79 },
   '2B': { cssColor: 'rgba(40, 37, 35, 1)', svgHex: '#282523', darknessFactor: 0.85 },
-  '4B': { cssColor: 'rgba(26, 24, 23, 1)', svgHex: '#1a1817', darknessFactor: 0.91 },
-  '6B': { cssColor: 'rgba(15, 14, 13, 1)', svgHex: '#0f0e0d', darknessFactor: 0.95 },
+  '4B': { cssColor: 'rgba(25, 23, 22, 1)', svgHex: '#191716', darknessFactor: 0.91 },
+  '6B': { cssColor: 'rgba(14, 13, 12, 1)', svgHex: '#0e0d0c', darknessFactor: 0.95 },
 };
 
 export interface RasterScratchBuffer {
@@ -61,8 +61,73 @@ export function getGraphiteSpec(brush: BrushStyle, layer?: StrokeLayer): Graphit
 }
 
 /**
- * Builds a deterministic, variable-width tapered ribbon polygon shared by
- * both Canvas 2D rendering and SVG vector export.
+ * Deterministic 2D cold-press sketch paper tooth height field in [0..1].
+ * Anchored in canvas coordinates (x, y) so neighboring parallel hatching strokes
+ * catch dry graphite on the same paper fiber peaks and skip across micro-valleys.
+ */
+export function paperTooth2D(x: number, y: number): number {
+  const fine = valueNoise2D(x * 0.78, y * 0.78, 1301);
+  const medium = valueNoise2D(x * 0.31 + 7.3, y * 0.31 - 5.1, 4919);
+  const pore = latticeHash01(Math.floor(x * 1.15), Math.floor(y * 1.15), 8191);
+  return clamp01(fine * 0.48 + medium * 0.28 + pore * 0.24);
+}
+
+function valueNoise2D(x: number, y: number, seed: number): number {
+  const ix = Math.floor(x);
+  const iy = Math.floor(y);
+  const fx = x - ix;
+  const fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx);
+  const uy = fy * fy * (3 - 2 * fy);
+
+  const n00 = latticeHash01(ix, iy, seed);
+  const n10 = latticeHash01(ix + 1, iy, seed);
+  const n01 = latticeHash01(ix, iy + 1, seed);
+  const n11 = latticeHash01(ix + 1, iy + 1, seed);
+
+  const nx0 = n00 + (n10 - n00) * ux;
+  const nx1 = n01 + (n11 - n01) * ux;
+  return nx0 + (nx1 - nx0) * uy;
+}
+
+function latticeHash01(ix: number, iy: number, seed: number): number {
+  let h = (Math.imul(ix, 374761393) ^ Math.imul(iy, 668265263) ^ Math.imul(seed, 1442695041)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
+}
+
+function densifyForPaperTooth(points: StrokePoint[], grain: number): StrokePoint[] {
+  if (grain <= 0.01 || points.length < 2) return points;
+
+  let totalLen = 0;
+  for (let i = 1; i < points.length; i++) {
+    totalLen += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+  }
+  if (totalLen < 3.2) return points;
+
+  const targetStep = clamp(totalLen / 26, 1.5, 3.2);
+  const out: StrokePoint[] = [points[0]];
+
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i];
+    const b = points[i + 1];
+    const segLen = Math.hypot(b.x - a.x, b.y - a.y);
+    const steps = Math.max(1, Math.min(20, Math.round(segLen / targetStep)));
+    for (let s = 1; s <= steps; s++) {
+      const t = s / steps;
+      out.push({
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
+        pressure: (a.pressure ?? 0.6) + ((b.pressure ?? 0.6) - (a.pressure ?? 0.6)) * t,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Builds a deterministic, needle-tapered dry-graphite ribbon polygon modulated by
+ * 2D cold-press paper tooth, shared by both Canvas 2D rendering and SVG vector export.
  */
 export function buildStrokeRibbonPolygon(
   points: StrokePoint[],
@@ -71,34 +136,51 @@ export function buildStrokeRibbonPolygon(
 ): Array<{ x: number; y: number }> {
   if (points.length === 0) return [];
 
+  const grain = clamp01(brush.grain);
+  const dense = densifyForPaperTooth(points, grain);
   const random = new SeededRandom(seed);
-  const jitterSpan = brush.jitter * 1.8;
-  const jittered: StrokePoint[] = points.map((pt) => ({
-    x: pt.x + (random.next() - 0.5) * jitterSpan,
-    y: pt.y + (random.next() - 0.5) * jitterSpan,
-    pressure: pt.pressure ?? 0.6,
-  }));
+  const jitterSpan = brush.jitter * 1.1;
 
-  const halfWidths = jittered.map((pt) =>
-    Math.max(0.22, strokeWidthAt(brush.width, pt.pressure) * 0.5)
-  );
+  const jittered: StrokePoint[] = dense.map((pt, idx) => {
+    const endFade =
+      dense.length > 2 ? Math.min(1, Math.min(idx, dense.length - 1 - idx) / 2) : 0.4;
+    const j = jitterSpan * endFade;
+    return {
+      x: pt.x + (random.next() - 0.5) * j,
+      y: pt.y + (random.next() - 0.5) * j,
+      pressure: pt.pressure ?? 0.6,
+    };
+  });
 
-  if (brush.grain > 0) {
-    let phase = random.range(0, Math.PI * 2);
-    for (let i = 0; i < halfWidths.length; i++) {
-      phase += 0.62 + random.range(-0.14, 0.14);
-      const toothModulation = 1 - brush.grain * 0.32 * (0.5 + 0.5 * Math.sin(phase));
-      halfWidths[i] = Math.max(0.18, halfWidths[i] * toothModulation);
+  const lastIdx = jittered.length - 1;
+  const halfWidths = jittered.map((pt, idx) => {
+    const p = clamp01(pt.pressure);
+    // Preserve full crisp body thickness on contours & mid-strokes while sharpening low-pressure tips (< 0.12) to needle points!
+    const tipSharpener = p < 0.12 ? p / 0.12 : 1.0;
+    let hw = Math.max(0.035, strokeWidthAt(brush.width, p) * 0.5 * tipSharpener);
+    if (grain > 0) {
+      const tooth = paperTooth2D(pt.x, pt.y);
+      const pressDepth = clamp01(p * 0.6 + brush.hardness * 0.18);
+      const valleyCutoff = (1 - pressDepth) * 0.46;
+      const contact = clamp01((tooth - valleyCutoff) / Math.max(0.26, 1 - valleyCutoff));
+      // Balanced dry paper-tooth modulation: porous valleys + slightly fuller peaks so average tonal weight stays rich!
+      const modulation = (1 - grain * 0.58) + grain * 0.84 * contact;
+      hw = Math.max(0.03, hw * modulation);
     }
-  }
+    if (lastIdx >= 2 && (idx === 0 || idx === lastIdx) && p < 0.18) {
+      hw = Math.min(hw, 0.14);
+    }
+    return hw;
+  });
 
   if (jittered.length === 1) {
+    const r = Math.max(0.16, halfWidths[0]);
     const disc: Array<{ x: number; y: number }> = [];
-    for (let i = 0; i < 14; i++) {
-      const angle = (i / 14) * Math.PI * 2;
+    for (let i = 0; i < 10; i++) {
+      const angle = (i / 10) * Math.PI * 2;
       disc.push({
-        x: jittered[0].x + Math.cos(angle) * halfWidths[0],
-        y: jittered[0].y + Math.sin(angle) * halfWidths[0],
+        x: jittered[0].x + Math.cos(angle) * r,
+        y: jittered[0].y + Math.sin(angle) * r,
       });
     }
     return disc;
@@ -124,13 +206,30 @@ export function buildStrokeRibbonPolygon(
   }
 
   const polygon: Array<{ x: number; y: number }> = [...left];
-  const lastIdx = jittered.length - 1;
-  appendSemicircleCap(polygon, jittered[lastIdx], tangents[lastIdx], halfWidths[lastIdx], 1);
+
+  if (halfWidths[lastIdx] < 0.3) {
+    const reach = Math.min(0.9, halfWidths[lastIdx] * 2.5);
+    polygon.push({
+      x: jittered[lastIdx].x + tangents[lastIdx].x * reach,
+      y: jittered[lastIdx].y + tangents[lastIdx].y * reach,
+    });
+  } else {
+    appendSemicircleCap(polygon, jittered[lastIdx], tangents[lastIdx], halfWidths[lastIdx], 1);
+  }
 
   for (let i = right.length - 1; i >= 0; i--) {
     polygon.push(right[i]);
   }
-  appendSemicircleCap(polygon, jittered[0], tangents[0], halfWidths[0], -1);
+
+  if (halfWidths[0] < 0.3) {
+    const reach = Math.min(0.9, halfWidths[0] * 2.5);
+    polygon.push({
+      x: jittered[0].x - tangents[0].x * reach,
+      y: jittered[0].y - tangents[0].y * reach,
+    });
+  } else {
+    appendSemicircleCap(polygon, jittered[0], tangents[0], halfWidths[0], -1);
+  }
 
   return polygon;
 }
@@ -167,7 +266,8 @@ export function rasterizeStrokeCoverage(
   if (points.length === 0) return;
 
   const spec = getGraphiteSpec(brush, layer);
-  const grainWidthAttenuation = 1 - clamp01(brush.grain) * 0.16;
+  const grain = clamp01(brush.grain);
+  const grainWidthAttenuation = 1 - grain * 0.36;
   const effectiveOpacity = clamp01(brush.opacity) * spec.darknessFactor;
   if (effectiveOpacity <= 0.001) return;
 
@@ -188,7 +288,7 @@ export function rasterizeStrokeCoverage(
 
   if (points.length === 1) {
     const pt = points[0];
-    const r = Math.max(0.2, strokeWidthAt(brush.width, pt.pressure) * 0.5 * grainWidthAttenuation);
+    const r = Math.max(0.06, strokeWidthAt(brush.width, pt.pressure) * 0.5 * grainWidthAttenuation);
     const sx0 = Math.max(0, Math.floor(pt.x - r - 1));
     const sx1 = Math.min(width - 1, Math.ceil(pt.x + r + 1));
     const sy0 = Math.max(0, Math.floor(pt.y - r - 1));
@@ -198,16 +298,17 @@ export function rasterizeStrokeCoverage(
       const dy = y + 0.5 - pt.y;
       for (let x = sx0; x <= sx1; x++) {
         const dx = x + 0.5 - pt.x;
-        const cov = r + 0.5 - Math.sqrt(dx * dx + dy * dy);
-        if (cov > 0) recordPixel(row + x, cov > 1 ? 1 : cov);
+        const d = Math.sqrt(dx * dx + dy * dy);
+        const cov = Math.min(d + r, 0.5) - Math.max(d - r, -0.5);
+        if (cov > 0) recordPixel(row + x, cov);
       }
     }
   } else {
     for (let i = 0; i < points.length - 1; i++) {
       const a = points[i];
       const b = points[i + 1];
-      const ra = Math.max(0.2, strokeWidthAt(brush.width, a.pressure) * 0.5 * grainWidthAttenuation);
-      const rb = Math.max(0.2, strokeWidthAt(brush.width, b.pressure) * 0.5 * grainWidthAttenuation);
+      const ra = Math.max(0.04, strokeWidthAt(brush.width, a.pressure) * 0.5 * grainWidthAttenuation);
+      const rb = Math.max(0.04, strokeWidthAt(brush.width, b.pressure) * 0.5 * grainWidthAttenuation);
       const rSeg = ra > rb ? ra : rb;
 
       const sx0 = Math.max(0, Math.floor((a.x < b.x ? a.x : b.x) - rSeg - 1));
@@ -238,8 +339,9 @@ export function rasterizeStrokeCoverage(
           const distSq = distX * distX + distY * distY;
           if (distSq >= maxCheck * maxCheck) continue;
 
-          const cov = maxCheck - Math.sqrt(distSq);
-          recordPixel(row + x, cov > 1 ? 1 : cov);
+          const dist = Math.sqrt(distSq);
+          const cov = Math.min(dist + radiusAtT, 0.5) - Math.max(dist - radiusAtT, -0.5);
+          if (cov > 0) recordPixel(row + x, cov);
         }
       }
     }

@@ -13,10 +13,10 @@ const LAYER_PRECEDENCE: Record<StrokeLayer, number> = {
 const TONAL_LAYERS: StrokeLayer[] = ['lightTone', 'midTone', 'darkTone', 'finalAccent'];
 
 const TONAL_WEIGHT: Partial<Record<StrokeLayer, number>> = {
-  lightTone: 1.0,
-  midTone: 1.25,
-  darkTone: 1.65,
-  finalAccent: 2.2,
+  lightTone: 1.8,
+  midTone: 1.4,
+  darkTone: 1.5,
+  finalAccent: 2.0,
 };
 
 function compareStrokePriority(a: Stroke, b: Stroke): number {
@@ -80,6 +80,23 @@ export function orderStrokes(strokes: Stroke[], maxStrokeCount = 8000): Stroke[]
       }
       quotas.set(layer, quota);
       quotaSum += quota;
+    }
+
+    // Redistribute any surplus left over from layers capped at list.length so we never discard
+    // valid tonal strokes unnecessarily when only slightly above maxStrokeCount.
+    while (quotaSum < remaining) {
+      let added = false;
+      for (const layer of TONAL_LAYERS) {
+        if (quotaSum >= remaining) break;
+        const list = groups.get(layer) as Stroke[];
+        const q = quotas.get(layer) ?? 0;
+        if (q < list.length) {
+          quotas.set(layer, q + 1);
+          quotaSum++;
+          added = true;
+        }
+      }
+      if (!added) break;
     }
 
     while (quotaSum > remaining) {
@@ -174,23 +191,37 @@ function chainWithinLayerBands(sorted: Stroke[]): Stroke[] {
       for (let step = 0; step < pool.length; step++) {
         let bestIdx = -1;
         let bestDistSq = Infinity;
+        let reverseBest = false;
 
         for (let i = 0; i < pool.length; i++) {
           if (used[i]) continue;
-          const startPt = pool[i].points[0];
-          const dx = startPt.x - lastEndX;
-          const dy = startPt.y - lastEndY;
-          // Mild index penalty preserves high-priority sub-ranking when distances are comparable
-          const cost = dx * dx + dy * dy + i * 2.5;
-          if (cost < bestDistSq) {
-            bestDistSq = cost;
+          const pts = pool[i].points;
+          const startPt = pts[0];
+          const endPt = pts[pts.length - 1];
+          const dx0 = startPt.x - lastEndX;
+          const dy0 = startPt.y - lastEndY;
+          const cost0 = dx0 * dx0 + dy0 * dy0 + i * 2.2;
+          if (cost0 < bestDistSq) {
+            bestDistSq = cost0;
             bestIdx = i;
+            reverseBest = false;
+          }
+          const dx1 = endPt.x - lastEndX;
+          const dy1 = endPt.y - lastEndY;
+          const cost1 = dx1 * dx1 + dy1 * dy1 + i * 2.2 + 4;
+          if (cost1 < bestDistSq) {
+            bestDistSq = cost1;
+            bestIdx = i;
+            reverseBest = true;
           }
         }
 
         if (bestIdx < 0) break;
         used[bestIdx] = 1;
-        const chosen = pool[bestIdx];
+        let chosen = pool[bestIdx];
+        if (reverseBest && chosen.points.length >= 2) {
+          chosen = { ...chosen, points: [...chosen.points].reverse() };
+        }
         output.push(chosen);
         const endPt = chosen.points[chosen.points.length - 1];
         if (endPt) {

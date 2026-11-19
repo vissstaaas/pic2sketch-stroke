@@ -10,6 +10,12 @@ import { computeCoherentLines } from '../lib/image/coherentLineDrawing';
 import { computeEdgeTangentFlow } from '../lib/image/edgeTangentFlow';
 import { mapPencilToneField } from '../lib/image/pencilToneMapping';
 import { PlaybackController } from '../lib/playback/PlaybackController';
+import {
+  buildPlotterPlan,
+  DEFAULT_PLOTTER_CONFIG,
+  exportPlotterCenterlineSvg,
+  exportPlotterGcode,
+} from '../lib/plotter/buildPlotterPlan';
 import { generateConstructionStrokes } from '../lib/strokes/generateConstructionStrokes';
 import { generateDetailContours } from '../lib/strokes/generateDetailContours';
 import { generateResidualStrokes } from '../lib/strokes/generateResidualStrokes';
@@ -445,5 +451,153 @@ describe('End-to-End Pipeline Performance & Boundary Integrity', () => {
         expect(pt.pressure).toBeLessThanOrEqual(1.0);
       }
     }
+  });
+});
+
+
+describe('Robotic Arm & Pen Plotter Toolpath Planner (buildPlotterPlan)', () => {
+  function createHatchingTestScript(): StrokeScript {
+    const strokes: Stroke[] = [];
+    // Add 30 parallel hatching strokes spaced ~2.5px apart in a 200x300 canvas
+    // On A5 portrait (148x210mm, margin 12 -> inner ~124x186mm), scale ~0.62 -> ~1.55mm spacing
+    // This will merge via continuous zigzag across fast/standard tiers!
+    for (let i = 0; i < 30; i++) {
+      const y = 30 + i * 2.5;
+      strokes.push({
+        id: `hatch-${i}`,
+        kind: 'hatching',
+        layer: 'midTone',
+        order: i,
+        points: [
+          { x: 40, y, pressure: 0.65 },
+          { x: 80, y: y + 1.2, pressure: 0.72 },
+        ],
+        brush: { width: 1.8, opacity: 0.55, hardness: 0.5, grain: 0.2, jitter: 0, grade: '2B' },
+        durationMs: 40,
+        priority: 30,
+        sourceConfidence: 0.9,
+      });
+    }
+    // Add distant contour strokes
+    strokes.push({
+      id: 'contour-0',
+      kind: 'contour',
+      layer: 'outline',
+      order: 30,
+      points: [
+        { x: 20, y: 20, pressure: 0.8 },
+        { x: 180, y: 20, pressure: 0.8 },
+        { x: 180, y: 280, pressure: 0.8 },
+      ],
+      brush: { width: 1.2, opacity: 0.85, hardness: 0.7, grain: 0.1, jitter: 0, grade: 'HB' },
+      durationMs: 60,
+      priority: 60,
+      sourceConfidence: 1.0,
+    });
+
+    // Add a faint 2H construction scaffolding line (must be excluded by default from plotter plan)
+    strokes.push({
+      id: 'struct-0',
+      kind: 'construction',
+      layer: 'structure',
+      order: 31,
+      points: [
+        { x: 10, y: 150, pressure: 0.2 },
+        { x: 190, y: 150, pressure: 0.2 },
+      ],
+      brush: { width: 1.0, opacity: 0.035, hardness: 0.2, grain: 0.1, jitter: 0, grade: '2H' },
+      durationMs: 20,
+      priority: 10,
+      sourceConfidence: 0.6,
+    });
+
+    return {
+      version: '1.0',
+      sourceImage: {
+        width: 200,
+        height: 300,
+        processedWidth: 200,
+        processedHeight: 300,
+        mimeType: 'image/png',
+      },
+      canvas: { width: 200, height: 300, background: '#fbf8f1', padding: 0 },
+      generation: {
+        seed: 42,
+        createdAt: new Date().toISOString(),
+        options: {} as StrokeGenerationOptions,
+        strokeCount: strokes.length,
+      },
+      strokes,
+    };
+  }
+
+  it('merges close parallel hatching via zigzag optimization and respects physical margins', () => {
+    const script = createHatchingTestScript();
+
+    const fastPlan = buildPlotterPlan(script, { ...DEFAULT_PLOTTER_CONFIG, tier: 'fast' });
+    const stdPlan = buildPlotterPlan(script, { ...DEFAULT_PLOTTER_CONFIG, tier: 'standard' });
+    const finePlan = buildPlotterPlan(script, { ...DEFAULT_PLOTTER_CONFIG, tier: 'fine' });
+
+    expect(fastPlan.paperWidthMm).toBe(148);
+    expect(fastPlan.paperHeightMm).toBe(210);
+    expect(fastPlan.isLandscape).toBe(false);
+
+    // 2H construction scaffolding must be omitted from physical plotter plans
+    expect(stdPlan.strokes.some((s) => s.layer === 'structure')).toBe(false);
+    expect(stdPlan.strokes.every((s) => s.brushOpacity > 0 && s.brushWidthMm > 0)).toBe(true);
+
+    // Parallel strokes separated by ~1.55mm must merge significantly on fast & standard tiers
+    expect(fastPlan.telemetry.penLifts).toBeLessThan(fastPlan.telemetry.sampledStrokes);
+    expect(stdPlan.telemetry.penLifts).toBeLessThan(stdPlan.telemetry.sampledStrokes);
+    expect(fastPlan.telemetry.savedLiftPct).toBeGreaterThan(40);
+    expect(finePlan.strokes.length).toBeGreaterThanOrEqual(fastPlan.strokes.length);
+
+    // Verify Z-turnaround feathering exists on merged parallel zigzags
+    expect(stdPlan.strokes.some((s) => s.points.some((p) => p.isTurnaround === true))).toBe(true);
+
+    // Verify all coordinates stay strictly within physical paper bounds and respect margin
+    for (const stroke of stdPlan.strokes) {
+      expect(stroke.points.length).toBeGreaterThanOrEqual(2);
+      for (const pt of stroke.points) {
+        expect(pt.x).toBeGreaterThanOrEqual(stdPlan.config.marginMm - 0.5);
+        expect(pt.x).toBeLessThanOrEqual(stdPlan.paperWidthMm - stdPlan.config.marginMm + 0.5);
+        expect(pt.y).toBeGreaterThanOrEqual(stdPlan.config.marginMm - 0.5);
+        expect(pt.y).toBeLessThanOrEqual(stdPlan.paperHeightMm - stdPlan.config.marginMm + 0.5);
+      }
+    }
+  });
+
+  it('exports valid Z-axis 3D G-code, GRBL M3/M5 G-code, and single-centerline mm SVG', () => {
+    const script = createHatchingTestScript();
+
+    const zPlan = buildPlotterPlan(script, {
+      ...DEFAULT_PLOTTER_CONFIG,
+      protocol: 'zaxis',
+      paper: 'postcard',
+    });
+    expect(zPlan.paperWidthMm).toBe(100);
+    expect(zPlan.paperHeightMm).toBe(150);
+
+    const zGcode = exportPlotterGcode(zPlan);
+    expect(zGcode).toContain('G21 ; Millimeter units');
+    expect(zGcode).toContain('G90 ; Absolute positioning');
+    expect(zGcode).toMatch(/G1 X\d+\.\d{2} Y\d+\.\d{2} Z-\d+\.\d{2}/);
+    expect(zGcode).toContain('G0 Z4.00');
+    expect(zGcode).toContain('M2');
+
+    const grblPlan = buildPlotterPlan(script, {
+      ...DEFAULT_PLOTTER_CONFIG,
+      protocol: 'grbl',
+      paper: 'A4',
+    });
+    const grblGcode = exportPlotterGcode(grblPlan);
+    expect(grblGcode).toMatch(/M3 S\d+/);
+    expect(grblGcode).toContain('M5 ; Servo up');
+
+    const centerlineSvg = exportPlotterCenterlineSvg(zPlan);
+    expect(centerlineSvg).toContain('width="100mm" height="150mm" viewBox="0 0 100 150"');
+    expect(centerlineSvg).toContain('<polyline points=');
+    // Must NOT emit filled ribbon <path> outlines that double-draw on plotters
+    expect(centerlineSvg).not.toContain('<path ');
   });
 });

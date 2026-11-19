@@ -8,7 +8,7 @@ interface ImageUploaderProps {
 
 const VALID_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/jpg'];
 const MAX_FILE_BYTES = 50 * 1024 * 1024;
-const DEMO_SAMPLE_URL = new URL('../../samples/pasted-1-768.png', import.meta.url).href;
+export const DEMO_SAMPLE_URL = new URL('../../samples/pasted-1-768.png', import.meta.url).href;
 
 export const ImageUploader: React.FC<ImageUploaderProps> = ({
   onFileSelect,

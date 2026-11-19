@@ -101,27 +101,27 @@ export class SketchCanvasEngine {
     const seed = this.script?.generation.seed || 42;
     const grain = this.script?.generation.options.paperGrain ?? 0.35;
     if (grain > 0.02) {
-      const darkSpeckAlpha = (0.008 + grain * 0.016).toFixed(4);
-      const warmFiberAlpha = (0.006 + grain * 0.012).toFixed(4);
-      const step = 7;
+      const darkSpeckAlpha = (0.012 + grain * 0.024).toFixed(4);
+      const warmFiberAlpha = (0.01 + grain * 0.02).toFixed(4);
+      const step = 5;
 
-      this.ctx.fillStyle = `rgba(42, 36, 30, ${darkSpeckAlpha})`;
+      this.ctx.fillStyle = `rgba(46, 40, 34, ${darkSpeckAlpha})`;
       for (let y = 0; y < this.height; y += step) {
         for (let x = 0; x < this.width; x += step) {
           const hash = ((x * 73856093) ^ (y * 19349663) ^ seed) >>> 0;
-          if ((hash % 100) < 28) {
-            const ox = hash % 5;
-            const oy = (hash >>> 4) % 5;
+          if ((hash % 100) < 32) {
+            const ox = hash % 4;
+            const oy = (hash >>> 4) % 4;
             this.ctx.fillRect(x + ox, y + oy, 1, 1);
           }
         }
       }
 
       this.ctx.fillStyle = `rgba(140, 122, 98, ${warmFiberAlpha})`;
-      for (let y = 3; y < this.height; y += step * 2) {
+      for (let y = 2; y < this.height; y += step * 2) {
         for (let x = 2; x < this.width; x += step * 2) {
           const hash = ((x * 83492791) ^ (y * 2971215073) ^ (seed + 17)) >>> 0;
-          if ((hash % 100) < 22) {
+          if ((hash % 100) < 26) {
             this.ctx.fillRect(x, y, 2, 1);
           }
         }

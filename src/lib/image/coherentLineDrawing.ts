@@ -35,6 +35,14 @@ export function computeCoherentLines(
   const centerWeights = buildGaussianWeights(normalRadius, sigmaCenter);
   const surroundWeights = buildGaussianWeights(normalRadius, sigmaSurround);
 
+  // Perceptual shadow-lifted luminance so dark skin, shadowed eyes, and dark objects
+  // retain crisp FDoG feature ridges without amplifying bright-skin micro-noise.
+  const perceptual = new Float32Array(size);
+  for (let i = 0; i < size; i++) {
+    const g = clamp01(grayscale[i]);
+    perceptual[i] = 0.68 * g + 0.32 * Math.sqrt(g);
+  }
+
   // Step 1: 1D cross-edge DoG response along the local normal (-ty, tx).
   const crossDog = new Float32Array(size);
   const { tangentX, tangentY } = etf;
@@ -46,12 +54,12 @@ export function computeCoherentLines(
       const nx = -tangentY[idx];
       const ny = tangentX[idx];
 
-      let inner = grayscale[idx] * centerWeights[0];
-      let outer = grayscale[idx] * surroundWeights[0];
+      let inner = perceptual[idx] * centerWeights[0];
+      let outer = perceptual[idx] * surroundWeights[0];
 
       for (let k = 1; k <= normalRadius; k++) {
-        const forwardSample = sampleBilinear(grayscale, width, height, x + nx * k, y + ny * k);
-        const backwardSample = sampleBilinear(grayscale, width, height, x - nx * k, y - ny * k);
+        const forwardSample = sampleBilinear(perceptual, width, height, x + nx * k, y + ny * k);
+        const backwardSample = sampleBilinear(perceptual, width, height, x - nx * k, y - ny * k);
         const pairSum = forwardSample + backwardSample;
         inner += pairSum * centerWeights[k];
         outer += pairSum * surroundWeights[k];

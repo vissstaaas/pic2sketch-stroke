@@ -105,3 +105,83 @@ export function taperEnds(points: StrokePoint[], taperCount: number): void {
     points[i].pressure = clamp(points[i].pressure * taper, 0.14, 1);
   }
 }
+
+/**
+ * Nudges contour/construction points ~0.6px toward the dark side of a silhouette or specular
+ * boundary whenever a clean-paper pixel (darkness < 0.018) is within the brush's 1px halo,
+ * and trims endpoints that drift onto clean paper.
+ */
+export function tuckPointsOffCleanPaper(
+  points: StrokePoint[],
+  darkness: Float32Array,
+  width: number,
+  height: number,
+  nudgePx = 0.62
+): StrokePoint[] {
+  if (points.length < 2) return points;
+
+  const adjusted: StrokePoint[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const pt = points[i];
+    const cx = clamp(Math.round(pt.x), 1, width - 2);
+    const cy = clamp(Math.round(pt.y), 1, height - 2);
+    const cIdx = cy * width + cx;
+
+    const minNeighborDark = Math.min(
+      darkness[cIdx],
+      darkness[cIdx - 1],
+      darkness[cIdx + 1],
+      darkness[cIdx - width],
+      darkness[cIdx + width]
+    );
+
+    if (minNeighborDark >= 0.018) {
+      adjusted.push(pt);
+      continue;
+    }
+
+    // Search 3x3 neighborhood for the safest dark side of the edge
+    let bestScore = -1;
+    let bestDx = 0;
+    let bestDy = 0;
+    let maxDark = 0;
+    for (let dy = -1; dy <= 1; dy++) {
+      const ny = clamp(cy + dy, 1, height - 2);
+      const row = ny * width;
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = clamp(cx + dx, 1, width - 2);
+        const idx = row + nx;
+        const dHere = darkness[idx];
+        if (dHere > maxDark) maxDark = dHere;
+        const dMin4 = Math.min(
+          dHere,
+          darkness[idx - 1],
+          darkness[idx + 1],
+          darkness[idx - width],
+          darkness[idx + width]
+        );
+        const score = dHere + dMin4 * 1.6;
+        if (score > bestScore) {
+          bestScore = score;
+          bestDx = dx;
+          bestDy = dy;
+        }
+      }
+    }
+
+    if (maxDark < 0.02) {
+      continue;
+    }
+
+    const norm = Math.hypot(bestDx, bestDy);
+    const nx = norm > 0 ? clamp(pt.x + (bestDx / norm) * nudgePx, 1, width - 2) : pt.x;
+    const ny = norm > 0 ? clamp(pt.y + (bestDy / norm) * nudgePx, 1, height - 2) : pt.y;
+    adjusted.push({
+      x: Math.round(nx * 10) / 10,
+      y: Math.round(ny * 10) / 10,
+      pressure: darkness[cIdx] < 0.018 ? Math.min(pt.pressure, 0.28) : pt.pressure,
+    });
+  }
+
+  return adjusted;
+}

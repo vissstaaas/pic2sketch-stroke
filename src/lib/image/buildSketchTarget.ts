@@ -48,12 +48,18 @@ export function buildSketchTarget(
     rawGray[i] = (0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2]) / 255;
   }
 
-  const low = computePercentile(rawGray, 0.01);
-  const high = computePercentile(rawGray, 0.99);
-  const dynamicRange = Math.max(0.08, high - low);
+  const rawLow = computePercentile(rawGray, 0.01);
+  const rawHigh = computePercentile(rawGray, 0.99);
+  const rawSpan = rawHigh - rawLow;
+  // Normal photos (rawSpan >= 0.14) get full [rawLow..rawHigh] auto-levels;
+  // nearly flat synthetic sheets (e.g. 98%-white paper or 99%-black starfield where rawSpan < 0.08)
+  // preserve physical luminance instead of stretching tiny differences across [0..1].
+  const flatPreserve = 1 - smoothstep(0.05, 0.14, rawSpan);
+  const dynamicRange = Math.max(0.08, rawSpan);
   const normalized = new Float32Array(size);
   for (let i = 0; i < size; i++) {
-    normalized[i] = clamp01((rawGray[i] - low) / dynamicRange);
+    const stretched = clamp01((rawGray[i] - rawLow) / dynamicRange);
+    normalized[i] = stretched * (1 - flatPreserve) + rawGray[i] * flatPreserve;
   }
 
   const grayscale = bilateralSmooth(normalized, width, height, 1.4 * scale, 0.06);
@@ -66,29 +72,39 @@ export function buildSketchTarget(
   });
 
   // Single-ridge silhouette detector for low-contrast bright boundaries (shoulders, collars, pleats):
-  // Only fires at true gradient maxima perpendicular to ETF AND where grayscale is light (> 0.52),
-  // preventing double-outline halos around dark eyebrows, eyes, or lips.
+  // Requires both a gradient ridge AND a real physical luminance jump (>= 0.052) so smooth skin
+  // lighting roll-offs, soft fog/mist peaks, and 8-bit JPEG banding never produce crack/cap artifacts.
   const crispSilhouette = new Float32Array(size);
   const { gradientNorm, tangentX, tangentY } = etf;
+  const minSilGrad = stylePreset === 'landscape' ? 0.2 : 0.145;
+  const minSilCoh = stylePreset === 'landscape' ? 0.52 : 0.4;
   for (let y = 1; y < height - 1; y++) {
     const row = y * width;
     for (let x = 1; x < width - 1; x++) {
       const i = row + x;
       const g = gradientNorm[i];
-      if (g < 0.105 || grayscale[i] < 0.52) continue;
+      if (g < minSilGrad || grayscale[i] < 0.52 || etf.coherence[i] < minSilCoh) continue;
       const nx = -tangentY[i];
       const ny = tangentX[i];
+      const lumStep = Math.abs(
+        sampleBilinear(grayscale, width, height, x + nx * 1.4, y + ny * 1.4) -
+          sampleBilinear(grayscale, width, height, x - nx * 1.4, y - ny * 1.4)
+      );
+      if (lumStep < 0.056) continue;
       const front = sampleBilinear(gradientNorm, width, height, x + nx, y + ny);
       const back = sampleBilinear(gradientNorm, width, height, x - nx, y - ny);
       if (g >= front * 0.99 && g >= back * 0.99) {
         crispSilhouette[i] =
           smoothstep(0.52, 0.76, grayscale[i]) *
-          smoothstep(0.105, 0.36, g) *
+          smoothstep(0.056, 0.145, lumStep) *
+          smoothstep(minSilGrad, 0.38, g) *
           (0.4 + 0.6 * etf.coherence[i]) *
           0.52;
       }
     }
   }
+
+  const localAcutance = gaussianBlur(fdogLines, width, height, Math.max(3.0, 9.0 * scale));
 
   const inverted = new Float32Array(size);
   for (let i = 0; i < size; i++) inverted[i] = 1 - grayscale[i];
@@ -103,12 +119,29 @@ export function buildSketchTarget(
   const detail = new Float32Array(size);
   const structuralEdge = new Float32Array(size);
 
-  const lineWeight = stylePreset === 'lineart' ? 1.14 : stylePreset === 'dramatic' ? 0.96 : 1.0;
+  const lineWeight =
+    stylePreset === 'lineart'
+      ? 1.14
+      : stylePreset === 'architecture'
+        ? 1.12
+        : stylePreset === 'botanical'
+          ? 1.05
+          : stylePreset === 'pet'
+            ? 1.03
+            : stylePreset === 'landscape'
+              ? 0.9
+              : stylePreset === 'dramatic'
+                ? 0.98
+                : 1.0;
+
+  const bokehStrength = stylePreset === 'landscape' ? 0.1 : stylePreset === 'architecture' ? 0.16 : 0.32;
+  const gentleFormStart = stylePreset === 'landscape' || stylePreset === 'botanical' ? 0.045 : 0.08;
 
   for (let i = 0; i < size; i++) {
     const fg = foreground[i];
-    const bgToneFactor = lerpScalar(1, fg * fg, bgSuppression * 0.96);
-    const bgLineFactor = lerpScalar(1, 0.14 + 0.86 * fg, bgSuppression * 0.86);
+    const bgSuppressionStrength = clamp01(bgSuppression * 1.48);
+    const bgToneFactor = lerpScalar(1, fg * fg * fg, bgSuppressionStrength);
+    const bgLineFactor = lerpScalar(1, 0.08 + 0.92 * fg, clamp01(bgSuppression * 1.15));
 
     const dodgeLightness = clamp01(grayscale[i] / Math.max(0.028, 1 - blurredInverted[i]));
     const dodgeSoft = Math.pow(1 - dodgeLightness, 0.86) * 0.54;
@@ -119,21 +152,27 @@ export function buildSketchTarget(
         fdogLines[i] * 0.94,
         microDark * 0.8,
         crispSilhouette[i],
-        dodgeSoft * (0.38 + 0.62 * fdogLines[i])
+        dodgeSoft * fdogLines[i]
       ) *
         lineWeight *
         bgLineFactor
     );
 
     const sourceDark = 1 - grayscale[i];
-    const gentleFormGate = smoothstep(0.08, 0.42, sourceDark);
+    const gentleFormGate = smoothstep(gentleFormStart, 0.42, sourceDark);
     const deepMassGate = smoothstep(0.45, 0.82, sourceDark);
+    // Out-of-focus bokeh regions devoid of structural edges soften gently so in-focus subjects lead
+    const bokehFocusFactor =
+      1 - bgSuppression * bokehStrength * (1 - smoothstep(0.008, 0.036, localAcutance[i]));
     const calibratedTone = clamp01(
-      rawTone[i] * (0.34 * gentleFormGate + 0.66 * deepMassGate) * bgToneFactor
+      rawTone[i] *
+        (0.34 * gentleFormGate + 0.66 * deepMassGate) *
+        bgToneFactor *
+        bokehFocusFactor
     );
 
     let combined = 1 - (1 - crispLine) * (1 - calibratedTone);
-    if (crispLine < 0.015 && calibratedTone < 0.012) {
+    if (combined < 0.018 || (crispLine < 0.016 && calibratedTone < 0.014)) {
       combined = 0;
     }
 

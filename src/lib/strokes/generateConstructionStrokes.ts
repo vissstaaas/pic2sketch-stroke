@@ -4,7 +4,7 @@ import { clamp } from '../../utils/math';
 import type { SeededRandom } from '../../utils/random';
 import type { SketchTarget } from '../image/buildSketchTarget';
 import { computePercentile, gaussianBlur } from '../image/filters';
-import { pathLength, simplifyPoints, taperEnds } from './pathGeometry';
+import { pathLength, simplifyPoints, taperEnds, tuckPointsOffCleanPaper } from './pathGeometry';
 import { thinEdgeMap, traceEdgePaths } from './traceEdgePaths';
 
 /**
@@ -16,7 +16,7 @@ export function generateConstructionStrokes(
   options: StrokeGenerationOptions,
   rng: SeededRandom
 ): Stroke[] {
-  const { width, height, structuralEdge, foreground, tangentX, tangentY } = target;
+  const { width, height, darkness, structuralEdge, foreground, tangentX, tangentY } = target;
   if (width < 32 || height < 32) return [];
 
   const scale = clamp(Math.max(width, height) / 768, 0.45, 1.6);
@@ -50,10 +50,12 @@ export function generateConstructionStrokes(
 
   for (let i = 0; i < chains.length && strokes.length < maxStructureStrokes; i++) {
     const chain = chains[i];
-    const simplified = simplifyPoints(chain.points, Math.max(2.4, 4.0 * scale));
+    const simplified = simplifyPoints(chain.points, Math.max(1.6, 2.6 * scale));
     if (simplified.length < 2) continue;
 
-    const extended = addLightOverstroke(simplified, width, height, 3.0 * scale);
+    const rawExtended = addLightOverstroke(simplified, width, height, 2.2 * scale);
+    const extended = tuckPointsOffCleanPaper(rawExtended, darkness, width, height, 0.65 * scale);
+    if (extended.length < 2) continue;
     for (const pt of extended) {
       pt.pressure = clamp(pt.pressure * 0.52, 0.15, 0.45);
     }
